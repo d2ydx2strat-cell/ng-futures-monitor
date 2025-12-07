@@ -68,7 +68,7 @@ def get_eia_storage(api_key):
         "api_key": api_key,
         "frequency": "weekly",
         "data[0]": "value",   # <--- FIX: ONLY REQUEST 'value' HERE
-        "facets[series][]": "NG.NW2_EPG0_SWO_R48_BCF.W",
+        "facets[series][]": "NG.NW2_EPG0_SWO_R48_BCF.A",
         "sort[0][column]": "period",
         "sort[0][direction]": "desc",
         "offset": 0,
@@ -215,4 +215,5 @@ try:
 except Exception as e:
 
     st.error(f"Weather data error: {e}")
+
 
