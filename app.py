@@ -16,74 +16,31 @@ st.title("🔥 Global NG Spreads, Storage & Weather Monitor")
 
 EIA_API_KEY = "KzzwPVmMSTVCI3pQbpL9calvF4CqGgEbwWy0qqXV"
 
-# EIA weekly working gas series (v1 API)
-EIA_SERIES = {
-    "Lower 48 Total":         {"api": "v1", "id": "NG.W_EPG0_SWO_R48_BCF.W"},
-    "East":                   {"api": "v1", "id": "NG.W_EPG0_SWO_R31_BCF.W"},
-    "Midwest":                {"api": "v1", "id": "NG.W_EPG0_SWO_R32_BCF.W"},
-    "Mountain":               {"api": "v1", "id": "NG.W_EPG0_SWO_R33_BCF.W"},
-    "Pacific":                {"api": "v1", "id": "NG.W_EPG0_SWO_R34_BCF.W"},
-    "South Central Total":    {"api": "v1", "id": "NG.W_EPG0_SWO_R35_BCF.W"},
-    "South Central Salt":     {"api": "v1", "id": "NG.W_EPG0_SSO_R35_BCF.W"},
-    "South Central Non-Salt": {"api": "v1", "id": "NG.W_EPG0_SNO_R35_BCF.W"},
+# EIA weekly working gas series (v2 'series' facet values)
+# Taken directly from your CSV dump
+EIA_SERIES_V2 = {
+    "Lower 48 Total":         "NW2_EPG0_SWO_R48_BCF",
+    "East":                   "NW2_EPG0_SWO_R31_BCF",
+    "Midwest":                "NW2_EPG0_SWO_R32_BCF",
+    # EIA calls this "South Central Region" in your CSV
+    "South Central Total":    "NW2_EPG0_SWO_R33_BCF",
+    "Mountain":               "NW2_EPG0_SWO_R34_BCF",
+    "Pacific":                "NW2_EPG0_SWO_R35_BCF",
+    # Salt / Nonsalt regions (your CSV labels them "Salt Region" / "Nonsalt Region")
+    "South Central Salt":     "NW2_EPG0_SSO_R33_BCF",
+    "South Central Non-Salt": "NW2_EPG0_SNO_R33_BCF",
 }
 
 REGION_CAPACITY_BCF = {
     "Lower 48 Total": None,
     "East": None,
     "Midwest": None,
+    "South Central Total": None,
     "Mountain": None,
     "Pacific": None,
-    "South Central Total": None,
     "South Central Salt": None,
     "South Central Non-Salt": None,
 }
-
-@st.cache_data(ttl=3600*24)
-def get_eia_series_v1(api_key: str, series_id: str, length_weeks: int = 52 * 15) -> pd.DataFrame | None:
-    """
-    Fetch weekly storage from EIA v1 API using full series_id
-    (e.g., NG.W_EPG0_SWO_R48_BCF.W).
-    """
-    url = "https://api.eia.gov/series/"
-
-    params = {
-        "api_key": api_key,
-        "series_id": series_id,
-    }
-
-    try:
-        r = requests.get(url, params=params)
-        data = r.json()
-
-        if 'error' in data:
-            st.error(f"EIA v1 API Error for {series_id}: {data['error']}")
-            return None
-
-        if 'series' in data and data['series']:
-            s = data['series'][0]
-            rows = s['data']  # list of [date, value]
-            df = pd.DataFrame(rows, columns=['period_raw', 'value'])
-            # Weekly storage uses YYYYMMDD
-            df['period'] = pd.to_datetime(df['period_raw'], format='%Y%m%d')
-            df['value'] = pd.to_numeric(df['value'])
-            df = df.sort_values('period').reset_index(drop=True)
-            if len(df) > length_weeks:
-                df = df.tail(length_weeks).reset_index(drop=True)
-            return df
-        else:
-            st.error(f"EIA v1 Structure Error: no series data for {series_id}.")
-            return None
-
-    except Exception as e:
-        st.error(f"EIA v1 Fetch Error for {series_id}: {e}")
-        return None
-
-
-def get_storage_for_region(region_name: str, length_weeks: int = 52 * 15) -> pd.DataFrame | None:
-    meta = EIA_SERIES[region_name]
-    series_id = meta["id"]
-    return get_eia_series_v1(EIA_API_KEY, series_id, length_weeks=length_weeks)
 
 # Sidebar
 with st.sidebar:
@@ -93,36 +50,27 @@ with st.sidebar:
         st.rerun()
 
 # --- 1. DATA SOURCE: PRICES (International Spreads) ---
-@st.cache_data(ttl=3600*24)  # Cache for 24 hours
+@st.cache_data(ttl=3600*24)
 def get_price_data():
-    """
-    Fetches Henry Hub (US), and proxies for TTF (EU).
-    """
     tickers = ['NG=F', 'TTF=F']
     data = yf.download(tickers, period="1y", interval="1d")['Close']
 
-    # Clean up column names
     data.rename(columns={'NG=F': 'HenryHub_USD', 'TTF=F': 'TTF_EUR'}, inplace=True)
 
-    # Currency Conversion (Approximate EUR to USD for Spread)
     fx = yf.download("EURUSD=X", period="1d", interval="1d")['Close'].iloc[-1].item()
 
-    # Convert TTF (usually in EUR/MWh) to USD/MMBtu
-    # Conversion factor: 1 MWh = 3.412 MMBtu
     data['TTF_USD_MMBtu'] = (data['TTF_EUR'] * fx) / 3.412
-
-    # Calculate Spread (Arb Window)
     data['Spread_TTF_HH'] = data['TTF_USD_MMBtu'] - data['HenryHub_USD']
 
     return data.sort_index(ascending=False)
 
-# --- 2. DATA SOURCE: US STORAGE (EIA) ---
+# --- 2. DATA SOURCE: US STORAGE (EIA v2) ---
 
 @st.cache_data(ttl=3600*24)
-def get_eia_series_v2(api_key: str, region_code: str, length_weeks: int = 52 * 15) -> pd.DataFrame | None:
+def get_eia_storage_v2(api_key: str, series_id: str, length_weeks: int = 52 * 15) -> pd.DataFrame | None:
     """
     Fetch weekly storage from EIA v2 API using the 'series' facet.
-    region_code is something like 'R48', 'R31', 'R35', etc.
+    series_id is like 'NW2_EPG0_SWO_R48_BCF', 'NW2_EPG0_SSO_R33_BCF', etc.
     """
     url = "https://api.eia.gov/v2/natural-gas/stor/wkly/data/"
 
@@ -130,7 +78,7 @@ def get_eia_series_v2(api_key: str, region_code: str, length_weeks: int = 52 * 1
         "api_key": api_key,
         "frequency": "weekly",
         "data[0]": "value",
-        "facets[series][]": region_code,
+        "facets[series][]": series_id,
         "sort[0][column]": "period",
         "sort[0][direction]": "desc",
         "offset": 0,
@@ -142,7 +90,7 @@ def get_eia_series_v2(api_key: str, region_code: str, length_weeks: int = 52 * 1
         data = r.json()
 
         if 'error' in data:
-            st.error(f"EIA v2 API Error for {region_code}: {data['error']}")
+            st.error(f"EIA v2 API Error for {series_id}: {data['error']}")
             return None
 
         if 'response' in data and 'data' in data['response'] and data['response']['data']:
@@ -152,64 +100,20 @@ def get_eia_series_v2(api_key: str, region_code: str, length_weeks: int = 52 * 1
             df = df.sort_values('period').reset_index(drop=True)
             return df
         else:
-            st.error(f"EIA v2 Structure Error: API returned empty data for region {region_code}.")
+            st.error(f"EIA v2 Structure Error: API returned empty data for series {series_id}.")
             return None
 
     except Exception as e:
-        st.error(f"EIA v2 Fetch Error for {region_code}: {e}")
+        st.error(f"EIA v2 Fetch Error for {series_id}: {e}")
         return None
 
-
-@st.cache_data(ttl=3600*24)
-def get_eia_series_v1(api_key: str, series_id: str, length_weeks: int = 52 * 15) -> pd.DataFrame | None:
-    """
-    Fetch weekly storage from EIA v1 API using full series_id
-    (e.g., NW2_EPG0_SSO_R33_BCF for South Central Salt).
-    """
-    url = "https://api.eia.gov/series/"
-
-    params = {
-        "api_key": api_key,
-        "series_id": series_id,
-    }
-
-    try:
-        r = requests.get(url, params=params)
-        data = r.json()
-
-        if 'error' in data:
-            st.error(f"EIA v1 API Error for {series_id}: {data['error']}")
-            return None
-
-        if 'series' in data and data['series']:
-            s = data['series'][0]
-            # s['data'] is list of [date, value] with date as YYYYMMDD or YYYYMM
-            rows = s['data']
-            df = pd.DataFrame(rows, columns=['period_raw', 'value'])
-            # Weekly storage uses YYYYMMDD
-            df['period'] = pd.to_datetime(df['period_raw'], format='%Y%m%d')
-            df['value'] = pd.to_numeric(df['value'])
-            df = df.sort_values('period').reset_index(drop=True)
-            # Optionally trim to last N weeks
-            if len(df) > length_weeks:
-                df = df.tail(length_weeks).reset_index(drop=True)
-            return df
-        else:
-            st.error(f"EIA v1 Structure Error: no series data for {series_id}.")
-            return None
-
-    except Exception as e:
-        st.error(f"EIA v1 Fetch Error for {series_id}: {e}")
-        return None
+def get_storage_for_region(region_name: str, length_weeks: int = 52 * 15) -> pd.DataFrame | None:
+    series_id = EIA_SERIES_V2[region_name]
+    return get_eia_storage_v2(EIA_API_KEY, series_id, length_weeks=length_weeks)
 
 # --- 3. DATA SOURCE: WEATHER (HDD Forecast) ---
-@st.cache_data(ttl=3600*12)  # Update weather every 12 hours
+@st.cache_data(ttl=3600*12)
 def get_weather_demand():
-    """
-    Uses Open-Meteo to fetch 10-day forecast for key gas-consuming hubs:
-    Chicago (Midwest), New York (East), Houston (South - CDD).
-    Calculates proxy HDD (Heating Degree Days).
-    """
     cache_session = requests_cache.CachedSession('.cache', expire_after=3600)
     retry_session = retry(cache_session, retries=5, backoff_factor=0.2)
     openmeteo = openmeteo_requests.Client(session=retry_session)
@@ -253,26 +157,18 @@ def get_weather_demand():
 # --- HELPER: STORAGE ANALYTICS TRANSFORMS ---
 
 def compute_storage_analytics(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Given a storage_df with columns ['period', 'value'],
-    compute weekly deltas, 5y avg, deviation, z-score, cumulative deviation,
-    and percentile bands for fan chart.
-    """
     df = df.copy()
     df = df.sort_values('period').reset_index(drop=True)
 
     df['week_of_year'] = df['period'].dt.isocalendar().week.astype(int)
     df['year'] = df['period'].dt.year
 
-    # Weekly injection/withdrawal (delta)
     df['delta'] = df['value'].diff()
 
     grouped = df.groupby('week_of_year')
 
-    # Level stats by week_of_year
-    df['level_5y_avg'] = df['week_of_year'].map(grouped['value'].mean())
+    df['level_5y_avg'] = df['week_of_year'].map(grouped['value'].mean)
 
-    # Weekly delta stats by week_of_year
     delta_mean = grouped['delta'].mean()
     delta_std = grouped['delta'].std(ddof=0)
 
@@ -295,7 +191,6 @@ def compute_storage_analytics(df: pd.DataFrame) -> pd.DataFrame:
         axis=1
     )
 
-    # Level z-score
     level_mean = grouped['value'].mean()
     level_std = grouped['value'].std(ddof=0)
     df['level_zscore'] = df.apply(
@@ -303,11 +198,9 @@ def compute_storage_analytics(df: pd.DataFrame) -> pd.DataFrame:
         axis=1
     )
 
-    # Cumulative deviation vs 5y avg delta, by gas year (start April)
     df['gas_year'] = np.where(df['period'].dt.month >= 4, df['period'].dt.year, df['period'].dt.year - 1)
     df['cum_dev_vs_5y'] = df.groupby('gas_year')['delta_dev_vs_5y'].cumsum()
 
-    # Percentile bands for fan chart: by week_of_year across all years
     percentiles = grouped['value'].quantile([0.1, 0.25, 0.5, 0.75, 0.9]).unstack(level=1)
     percentiles.columns = ['p10', 'p25', 'p50', 'p75', 'p90']
     df = df.merge(percentiles, on='week_of_year', how='left')
@@ -341,8 +234,7 @@ st.markdown("---")
 # 2. Storage
 st.subheader("2. US Storage Levels (EIA Weekly)")
 
-# Region selector
-region_names = list(EIA_SERIES.keys())
+region_names = list(EIA_SERIES_V2.keys())
 default_region = "Lower 48 Total"
 selected_region = st.selectbox("Select Region / South Central Detail", region_names, index=region_names.index(default_region))
 
@@ -350,11 +242,9 @@ capacity_bcf = REGION_CAPACITY_BCF.get(selected_region)
 storage_df = get_storage_for_region(selected_region)
 
 if storage_df is not None and not storage_df.empty:
-    # Compute analytics on FULL history
     storage_df = compute_storage_analytics(storage_df)
     latest_storage = storage_df.iloc[-1]
 
-    # Metrics (still based on full-history stats)
     current_level = latest_storage['value']
     current_delta = latest_storage['delta']
     level_5y_avg = latest_storage['level_5y_avg']
@@ -384,14 +274,13 @@ if storage_df is not None and not storage_df.empty:
     else:
         s_col4.metric("Utilization (% of Capacity)", "N/A", delta=None)
 
-    # ---- LIMIT DISPLAY TO LAST 2 YEARS (104 WEEKS) ----
+    # Limit display to last 2 years
     display_window_weeks = 52 * 2
     display_df = storage_df.tail(display_window_weeks)
-    recent = display_df  # for deltas / z-scores
+    recent = display_df
 
-    # --- 2A. Storage Level + Fan Chart (last 2 years only) ---
+    # 2A. Storage + fan chart
     fig_store = go.Figure()
-
     fig_store.add_trace(go.Scatter(
         x=display_df['period'],
         y=display_df['p90'],
@@ -408,7 +297,6 @@ if storage_df is not None and not storage_df.empty:
         name='10–90% band',
         hoverinfo='skip'
     ))
-
     fig_store.add_trace(go.Scatter(
         x=display_df['period'],
         y=display_df['p75'],
@@ -425,21 +313,18 @@ if storage_df is not None and not storage_df.empty:
         name='25–75% band',
         hoverinfo='skip'
     ))
-
     fig_store.add_trace(go.Scatter(
         x=display_df['period'],
         y=display_df['p50'],
         line=dict(color='rgba(0,0,0,0.4)', dash='dash'),
         name='Median (hist.)'
     ))
-
     fig_store.add_trace(go.Scatter(
         x=display_df['period'],
         y=display_df['value'],
         line=dict(color='blue', width=2),
         name='Actual Storage'
     ))
-
     fig_store.update_layout(
         title=f"{selected_region} Storage vs Historical Distribution (Last 2 Years)",
         xaxis_title="Date",
@@ -449,9 +334,8 @@ if storage_df is not None and not storage_df.empty:
     )
     st.plotly_chart(fig_store, use_container_width=True)
 
-    # --- 2B. Weekly Injection/Withdrawal vs 5-Year Avg (last 2 years) ---
+    # 2B. Weekly delta vs 5y avg
     st.markdown("#### Storage Analytics: Weekly Balances vs History (Last 2 Years)")
-
     fig_delta = go.Figure()
     fig_delta.add_trace(go.Bar(
         x=recent['period'],
@@ -476,9 +360,8 @@ if storage_df is not None and not storage_df.empty:
     )
     st.plotly_chart(fig_delta, use_container_width=True)
 
-    # --- 2C. Deviation & Z-Score (last 2 years) ---
+    # 2C. Deviation & z-score
     c1, c2 = st.columns(2)
-
     with c1:
         fig_dev = go.Figure()
         fig_dev.add_trace(go.Bar(
@@ -516,17 +399,16 @@ if storage_df is not None and not storage_df.empty:
         )
         st.plotly_chart(fig_z, use_container_width=True)
 
-    # --- 2D. Cumulative Deviation vs 5-Year Avg (Gas Year) ---
+    # 2D. Cumulative deviation
     fig_cum = go.Figure()
     for gy, sub in storage_df.groupby('gas_year'):
-        if gy >= storage_df['gas_year'].max() - 4:  # last ~5 gas years
+        if gy >= storage_df['gas_year'].max() - 4:
             fig_cum.add_trace(go.Scatter(
                 x=sub['period'],
                 y=sub['cum_dev_vs_5y'],
                 mode='lines',
                 name=f"Gas Year {gy}"
             ))
-
     fig_cum.add_hline(y=0, line=dict(color='black', width=1))
     fig_cum.update_layout(
         title=f"{selected_region}: Cumulative Deviation vs 5-Year Avg (by Gas Year)",
@@ -553,6 +435,3 @@ try:
 
 except Exception as e:
     st.error(f"Weather data error: {e}")
-
-
-
