@@ -1,0 +1,32 @@
+name: Daily NG Report
+
+on:
+  schedule:
+    # Runs at 19:00 UTC daily
+    # Sydney is UTC+11 (AEDT), so 19:00 UTC = 06:00 AEDT next day.
+    # Note: When Sydney switches back to AEST (UTC+10), this will send at 05:00 AM.
+    - cron: '0 19 * * *'
+  workflow_dispatch: # Allows you to run it manually to test
+
+jobs:
+  send-report:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies
+        run: |
+          pip install pandas yfinance requests
+
+      - name: Run Report Script
+        env:
+          EIA_API_KEY: ${{ secrets.EIA_API_KEY }}
+          EMAIL_USER: ${{ secrets.EMAIL_USER }}
+          EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
+        run: python daily_report.py
