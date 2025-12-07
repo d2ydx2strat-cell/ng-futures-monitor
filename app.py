@@ -266,10 +266,11 @@ capacity_bcf = REGION_CAPACITY_BCF.get(selected_region)
 storage_df = get_eia_series(EIA_API_KEY, series_id)
 
 if storage_df is not None and not storage_df.empty:
+    # Compute analytics on FULL history
     storage_df = compute_storage_analytics(storage_df)
     latest_storage = storage_df.iloc[-1]
 
-    # Metrics
+    # Metrics (still based on full-history stats)
     current_level = latest_storage['value']
     current_delta = latest_storage['delta']
     level_5y_avg = latest_storage['level_5y_avg']
@@ -299,19 +300,24 @@ if storage_df is not None and not storage_df.empty:
     else:
         s_col4.metric("Utilization (% of Capacity)", "N/A", delta=None)
 
-    # --- 2A. Storage Level + Fan Chart ---
+    # ---- LIMIT DISPLAY TO LAST 2 YEARS (104 WEEKS) ----
+    display_window_weeks = 52 * 2
+    display_df = storage_df.tail(display_window_weeks)
+    recent = display_df  # for deltas / z-scores
+
+    # --- 2A. Storage Level + Fan Chart (last 2 years only) ---
     fig_store = go.Figure()
 
     fig_store.add_trace(go.Scatter(
-        x=storage_df['period'],
-        y=storage_df['p90'],
+        x=display_df['period'],
+        y=display_df['p90'],
         line=dict(width=0),
         showlegend=False,
         hoverinfo='skip'
     ))
     fig_store.add_trace(go.Scatter(
-        x=storage_df['period'],
-        y=storage_df['p10'],
+        x=display_df['period'],
+        y=display_df['p10'],
         fill='tonexty',
         fillcolor='rgba(0, 123, 255, 0.1)',
         line=dict(width=0),
@@ -320,15 +326,15 @@ if storage_df is not None and not storage_df.empty:
     ))
 
     fig_store.add_trace(go.Scatter(
-        x=storage_df['period'],
-        y=storage_df['p75'],
+        x=display_df['period'],
+        y=display_df['p75'],
         line=dict(width=0),
         showlegend=False,
         hoverinfo='skip'
     ))
     fig_store.add_trace(go.Scatter(
-        x=storage_df['period'],
-        y=storage_df['p25'],
+        x=display_df['period'],
+        y=display_df['p25'],
         fill='tonexty',
         fillcolor='rgba(0, 123, 255, 0.2)',
         line=dict(width=0),
@@ -337,21 +343,21 @@ if storage_df is not None and not storage_df.empty:
     ))
 
     fig_store.add_trace(go.Scatter(
-        x=storage_df['period'],
-        y=storage_df['p50'],
+        x=display_df['period'],
+        y=display_df['p50'],
         line=dict(color='rgba(0,0,0,0.4)', dash='dash'),
         name='Median (hist.)'
     ))
 
     fig_store.add_trace(go.Scatter(
-        x=storage_df['period'],
-        y=storage_df['value'],
+        x=display_df['period'],
+        y=display_df['value'],
         line=dict(color='blue', width=2),
         name='Actual Storage'
     ))
 
     fig_store.update_layout(
-        title=f"{selected_region} Storage vs Historical Distribution",
+        title=f"{selected_region} Storage vs Historical Distribution (Last 2 Years)",
         xaxis_title="Date",
         yaxis_title="Bcf",
         height=450,
@@ -359,10 +365,8 @@ if storage_df is not None and not storage_df.empty:
     )
     st.plotly_chart(fig_store, use_container_width=True)
 
-    # --- 2B. Weekly Injection/Withdrawal vs 5-Year Avg ---
-    st.markdown("#### Storage Analytics: Weekly Balances vs History")
-
-    recent = storage_df.tail(52 * 5)
+    # --- 2B. Weekly Injection/Withdrawal vs 5-Year Avg (last 2 years) ---
+    st.markdown("#### Storage Analytics: Weekly Balances vs History (Last 2 Years)")
 
     fig_delta = go.Figure()
     fig_delta.add_trace(go.Bar(
@@ -388,7 +392,7 @@ if storage_df is not None and not storage_df.empty:
     )
     st.plotly_chart(fig_delta, use_container_width=True)
 
-    # --- 2C. Deviation & Z-Score ---
+    # --- 2C. Deviation & Z-Score (last 2 years) ---
     c1, c2 = st.columns(2)
 
     with c1:
@@ -429,6 +433,7 @@ if storage_df is not None and not storage_df.empty:
         st.plotly_chart(fig_z, use_container_width=True)
 
     # --- 2D. Cumulative Deviation vs 5-Year Avg (Gas Year) ---
+    # This is already limited to last ~5 gas years; keep as-is
     fig_cum = go.Figure()
     for gy, sub in storage_df.groupby('gas_year'):
         if gy >= storage_df['gas_year'].max() - 4:  # last ~5 gas years
@@ -452,7 +457,6 @@ if storage_df is not None and not storage_df.empty:
 else:
     st.warning(f"⚠️ Could not load storage data for {selected_region}.")
 
-st.markdown("---")
 
 # 3. Weather
 st.subheader("3. 10-Day HDD Forecast (Gas Demand Proxy)")
@@ -467,3 +471,4 @@ try:
 
 except Exception as e:
     st.error(f"Weather data error: {e}")
+
