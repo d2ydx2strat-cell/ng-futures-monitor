@@ -191,6 +191,9 @@ if storage_df is not None:
         
         # Update the storage metric display text to reflect the region change
         latest_storage = storage_df.iloc[-1]
+        current_week = latest_storage['week_of_year']
+        avg_for_week = five_yr_avg.loc[current_week]
+        deficit = latest_storage['value'] - avg_for_week
         # ... (calculate avg and deficit) ...
         s_col1, s_col2 = st.columns(2)
         s_col1.metric("Lower 48 (Bcf)", f"{latest_storage['value']:,}", delta=f"{deficit:,.0f} vs 5yr Avg")
@@ -222,6 +225,7 @@ try:
 except Exception as e:
 
     st.error(f"Weather data error: {e}")
+
 
 
 
