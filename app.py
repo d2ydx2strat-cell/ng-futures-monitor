@@ -11,14 +11,38 @@ from plotly.subplots import make_subplots
 import numpy as np
 
 # --- CONFIGURATION ---
-import streamlit as st
-import pandas as pd
 st.set_page_config(page_title="NG Trading Monitor", layout="wide")
 st.title("🔥 Global NG Spreads, Storage & Weather Monitor")
-EIA_API_KEY = "KzzwPVmMSTVCI3pQbpL9calvF4CqGgEbwWy0qqXV"
-WORKING_SERIES_ID = "NW2_EPG0_SWO_R48_BCF"  # Lower 48 working gas
 
-# Sidebar for API Keys
+EIA_API_KEY = "KzzwPVmMSTVCI3pQbpL9calvF4CqGgEbwWy0qqXV"
+
+# EIA weekly working gas series IDs
+# These are standard Lower 48 + 5 regions + South Central salt / non-salt
+EIA_SERIES = {
+    "Lower 48 Total": "NW2_EPG0_SWO_R48_BCF",
+    "East": "NW2_EPG0_SWO_R31_BCF",
+    "Midwest": "NW2_EPG0_SWO_R32_BCF",
+    "Mountain": "NW2_EPG0_SWO_R33_BCF",
+    "Pacific": "NW2_EPG0_SWO_R34_BCF",
+    "South Central Total": "NW2_EPG0_SWO_R35_BCF",
+    "South Central Salt": "NW2_EPG0_SWO_R35S_BCF",
+    "South Central Non-Salt": "NW2_EPG0_SWO_R35N_BCF",
+}
+
+# If you know working gas capacity by region, you can hardcode here (Bcf).
+# For now, leave as None; logic will handle missing capacity.
+REGION_CAPACITY_BCF = {
+    "Lower 48 Total": None,
+    "East": None,
+    "Midwest": None,
+    "Mountain": None,
+    "Pacific": None,
+    "South Central Total": None,
+    "South Central Salt": None,
+    "South Central Non-Salt": None,
+}
+
+# Sidebar
 with st.sidebar:
     st.header("Settings")
     if st.button("Force Refresh Data"):
@@ -50,19 +74,24 @@ def get_price_data():
     return data.sort_index(ascending=False)
 
 # --- 2. DATA SOURCE: US STORAGE (EIA) ---
+
 @st.cache_data(ttl=3600*24)
-def get_eia_storage(api_key):
+def get_eia_series(api_key: str, series_id: str, length_weeks: int = 52 * 15) -> pd.DataFrame | None:
+    """
+    Generic fetcher for a single EIA weekly storage series.
+    Returns DataFrame with ['period', 'value'] sorted ascending by period.
+    """
     url = "https://api.eia.gov/v2/natural-gas/stor/wkly/data/"
 
     params = {
         "api_key": api_key,
         "frequency": "weekly",
         "data[0]": "value",
-        "facets[series][]": WORKING_SERIES_ID,
+        "facets[series][]": series_id,
         "sort[0][column]": "period",
         "sort[0][direction]": "desc",
         "offset": 0,
-        "length": 52 * 15  # pull more history for better stats
+        "length": length_weeks,
     }
 
     try:
@@ -70,23 +99,21 @@ def get_eia_storage(api_key):
         data = r.json()
 
         if 'error' in data:
-            st.error(f"EIA API Error: {data['error']}")
+            st.error(f"EIA API Error for {series_id}: {data['error']}")
             return None
 
         if 'response' in data and 'data' in data['response'] and data['response']['data']:
             df = pd.DataFrame(data['response']['data'])
-
             df['period'] = pd.to_datetime(df['period'])
             df['value'] = pd.to_numeric(df['value'])
-
             df = df.sort_values('period').reset_index(drop=True)
             return df
         else:
-            st.error("EIA Structure Error: API returned a valid structure but the data array is empty [].")
+            st.error(f"EIA Structure Error: API returned empty data for series {series_id}.")
             return None
 
     except Exception as e:
-        st.error(f"EIA Fetch Error: {e}")
+        st.error(f"EIA Fetch Error for {series_id}: {e}")
         return None
 
 # --- 3. DATA SOURCE: WEATHER (HDD Forecast) ---
@@ -97,18 +124,16 @@ def get_weather_demand():
     Chicago (Midwest), New York (East), Houston (South - CDD).
     Calculates proxy HDD (Heating Degree Days).
     """
-    # Setup Open-Meteo Client
     cache_session = requests_cache.CachedSession('.cache', expire_after=3600)
     retry_session = retry(cache_session, retries=5, backoff_factor=0.2)
     openmeteo = openmeteo_requests.Client(session=retry_session)
 
-    # Locations: Chicago, NYC, Houston
     params = {
         "latitude": [41.85, 40.71, 29.76],
         "longitude": [-87.62, -74.00, -95.36],
         "hourly": "temperature_2m",
         "timezone": "auto",
-        "forecast_days": 10
+        "forecast_days": 10,
     }
 
     url = "https://api.open-meteo.com/v1/forecast"
@@ -121,23 +146,17 @@ def get_weather_demand():
         hourly = response.Hourly()
         temp = hourly.Variables(0).ValuesAsNumpy()
 
-        # Create timestamps
         dates = pd.date_range(
             start=pd.to_datetime(hourly.Time(), unit="s", utc=True),
             end=pd.to_datetime(hourly.TimeEnd(), unit="s", utc=True),
             freq=pd.Timedelta(seconds=hourly.Interval()),
-            inclusive="left"
+            inclusive="left",
         )
 
         df = pd.DataFrame({"date": dates, "temp_c": temp})
+        df['temp_f'] = (df['temp_c'] * 9 / 5) + 32
+        df['HDD'] = df['temp_f'].apply(lambda x: max(0, 65 - x) / 24)
 
-        # Convert C to F
-        df['temp_f'] = (df['temp_c'] * 9/5) + 32
-
-        # Calculate HDD (Base 65F)
-        df['HDD'] = df['temp_f'].apply(lambda x: max(0, 65 - x) / 24)  # hourly -> daily contrib
-
-        # Aggregate by Day
         daily = df.groupby(df['date'].dt.date)['HDD'].sum().reset_index()
         daily['City'] = cities[i]
         results.append(daily)
@@ -146,6 +165,7 @@ def get_weather_demand():
     return final_df
 
 # --- HELPER: STORAGE ANALYTICS TRANSFORMS ---
+
 def compute_storage_analytics(df: pd.DataFrame) -> pd.DataFrame:
     """
     Given a storage_df with columns ['period', 'value'],
@@ -155,19 +175,15 @@ def compute_storage_analytics(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df = df.sort_values('period').reset_index(drop=True)
 
-    # Week-of-year (ISO)
     df['week_of_year'] = df['period'].dt.isocalendar().week.astype(int)
     df['year'] = df['period'].dt.year
 
     # Weekly injection/withdrawal (delta)
     df['delta'] = df['value'].diff()
 
-    # 5-year window for stats (rolling by calendar week)
-    # Filter to last N years for "current" stats; use more history for fan chart
-    # Here we use all history for stats by week_of_year
     grouped = df.groupby('week_of_year')
 
-    # 5-year average level by week_of_year (using all history as proxy)
+    # Level stats by week_of_year
     df['level_5y_avg'] = df['week_of_year'].map(grouped['value'].mean())
 
     # Weekly delta stats by week_of_year
@@ -176,27 +192,34 @@ def compute_storage_analytics(df: pd.DataFrame) -> pd.DataFrame:
 
     df['delta_5y_avg'] = df['week_of_year'].map(delta_mean)
     df['delta_dev_vs_5y'] = df['delta'] - df['delta_5y_avg']
+
+    def _safe_z(row, mean_series, std_series, col_name):
+        w = row['week_of_year']
+        if w not in std_series.index:
+            return np.nan
+        std = std_series.loc[w]
+        if std is None or np.isnan(std) or std == 0:
+            return np.nan
+        val = row[col_name]
+        mean = mean_series.loc[w]
+        return (val - mean) / std
+
     df['delta_zscore'] = df.apply(
-        lambda row: (row['delta'] - delta_mean.loc[row['week_of_year']]) / delta_std.loc[row['week_of_year']]
-        if (row['week_of_year'] in delta_std.index and delta_std.loc[row['week_of_year']] not in [0, np.nan])
-        else np.nan,
+        lambda r: _safe_z(r, delta_mean, delta_std, 'delta'),
         axis=1
     )
 
-    # Cumulative deviation vs 5y avg delta, by "gas year" (start April)
-    # Define gas year starting April 1
-    df['gas_year'] = np.where(df['period'].dt.month >= 4, df['period'].dt.year, df['period'].dt.year - 1)
-    df['cum_dev_vs_5y'] = df.groupby('gas_year')['delta_dev_vs_5y'].cumsum()
-
-    # Level z-score by week_of_year
+    # Level z-score
     level_mean = grouped['value'].mean()
     level_std = grouped['value'].std(ddof=0)
     df['level_zscore'] = df.apply(
-        lambda row: (row['value'] - level_mean.loc[row['week_of_year']]) / level_std.loc[row['week_of_year']]
-        if (row['week_of_year'] in level_std.index and level_std.loc[row['week_of_year']] not in [0, np.nan])
-        else np.nan,
+        lambda r: _safe_z(r, level_mean, level_std, 'value'),
         axis=1
     )
+
+    # Cumulative deviation vs 5y avg delta, by gas year (start April)
+    df['gas_year'] = np.where(df['period'].dt.month >= 4, df['period'].dt.year, df['period'].dt.year - 1)
+    df['cum_dev_vs_5y'] = df.groupby('gas_year')['delta_dev_vs_5y'].cumsum()
 
     # Percentile bands for fan chart: by week_of_year across all years
     percentiles = grouped['value'].quantile([0.1, 0.25, 0.5, 0.75, 0.9]).unstack(level=1)
@@ -218,7 +241,6 @@ try:
     col2.metric("TTF Proxy (EU)", f"${latest['TTF_USD_MMBtu']:.2f}", f"{price_df['TTF_USD_MMBtu'].diff().iloc[0]:.2f}")
     col3.metric("Spread (Export Arb)", f"${latest['Spread_TTF_HH']:.2f}", "High spread = Bullish US LNG")
 
-    # Chart
     fig_price = make_subplots(specs=[[{"secondary_y": True}]])
     fig_price.add_trace(go.Scatter(x=price_df.index, y=price_df['HenryHub_USD'], name="Henry Hub ($)"), secondary_y=False)
     fig_price.add_trace(go.Scatter(x=price_df.index, y=price_df['TTF_USD_MMBtu'], name="TTF EU ($/MMBtu)"), secondary_y=True)
@@ -233,31 +255,53 @@ st.markdown("---")
 # 2. Storage
 st.subheader("2. US Storage Levels (EIA Weekly)")
 
-storage_df = get_eia_storage(EIA_API_KEY)
-if storage_df is not None:
-    # Compute analytics
+# Region selector
+region_names = list(EIA_SERIES.keys())
+default_region = "Lower 48 Total"
+selected_region = st.selectbox("Select Region / South Central Detail", region_names, index=region_names.index(default_region))
+
+series_id = EIA_SERIES[selected_region]
+capacity_bcf = REGION_CAPACITY_BCF.get(selected_region)
+
+storage_df = get_eia_series(EIA_API_KEY, series_id)
+
+if storage_df is not None and not storage_df.empty:
     storage_df = compute_storage_analytics(storage_df)
-
     latest_storage = storage_df.iloc[-1]
-    current_week = latest_storage['week_of_year']
-    avg_for_week = latest_storage['level_5y_avg']
-    deficit = latest_storage['value'] - avg_for_week
 
-    s_col1, s_col2, s_col3 = st.columns(3)
-    s_col1.metric("Lower 48 Working Gas (Bcf)",
-                  f"{latest_storage['value']:,}",
-                  delta=f"{deficit:,.0f} vs 5yr Avg")
+    # Metrics
+    current_level = latest_storage['value']
+    current_delta = latest_storage['delta']
+    level_5y_avg = latest_storage['level_5y_avg']
+    delta_5y_avg = latest_storage['delta_5y_avg']
+    level_deficit = current_level - level_5y_avg
+    delta_deficit = current_delta - delta_5y_avg
+    level_z = latest_storage['level_zscore']
+
+    s_col1, s_col2, s_col3, s_col4 = st.columns(4)
+    s_col1.metric(f"{selected_region} Working Gas (Bcf)",
+                  f"{current_level:,.0f}",
+                  delta=f"{level_deficit:,.0f} vs 5yr Avg")
+
     s_col2.metric("Weekly Change (Bcf)",
-                  f"{latest_storage['delta']:,.0f}",
-                  delta=f"{latest_storage['delta_dev_vs_5y']:,.0f} vs 5yr Avg")
+                  f"{current_delta:,.0f}",
+                  delta=f"{delta_deficit:,.0f} vs 5yr Avg")
+
     s_col3.metric("Storage Level Z-Score",
-                  f"{latest_storage['level_zscore']:.2f}",
-                  delta="vs historical week-of-year")
+                  f"{level_z:.2f}" if pd.notna(level_z) else "N/A",
+                  delta="vs hist. week-of-year")
+
+    if capacity_bcf is not None:
+        pct_full = current_level / capacity_bcf * 100
+        s_col4.metric("Utilization (% of Capacity)",
+                      f"{pct_full:.1f}%",
+                      delta=None)
+    else:
+        s_col4.metric("Utilization (% of Capacity)", "N/A", delta=None)
 
     # --- 2A. Storage Level + Fan Chart ---
     fig_store = go.Figure()
 
-    # Fan chart bands (10-90 and 25-75)
     fig_store.add_trace(go.Scatter(
         x=storage_df['period'],
         y=storage_df['p90'],
@@ -292,7 +336,6 @@ if storage_df is not None:
         hoverinfo='skip'
     ))
 
-    # Median
     fig_store.add_trace(go.Scatter(
         x=storage_df['period'],
         y=storage_df['p50'],
@@ -300,7 +343,6 @@ if storage_df is not None:
         name='Median (hist.)'
     ))
 
-    # Actual storage
     fig_store.add_trace(go.Scatter(
         x=storage_df['period'],
         y=storage_df['value'],
@@ -309,7 +351,7 @@ if storage_df is not None:
     ))
 
     fig_store.update_layout(
-        title="Lower 48 Storage vs Historical Distribution",
+        title=f"{selected_region} Storage vs Historical Distribution",
         xaxis_title="Date",
         yaxis_title="Bcf",
         height=450,
@@ -320,20 +362,15 @@ if storage_df is not None:
     # --- 2B. Weekly Injection/Withdrawal vs 5-Year Avg ---
     st.markdown("#### Storage Analytics: Weekly Balances vs History")
 
-    # Focus on last ~5 years for readability
     recent = storage_df.tail(52 * 5)
 
     fig_delta = go.Figure()
-
-    # Actual weekly delta
     fig_delta.add_trace(go.Bar(
         x=recent['period'],
         y=recent['delta'],
         name='Actual Weekly Δ (Bcf)',
         marker_color=recent['delta'].apply(lambda x: 'red' if x < 0 else 'steelblue')
     ))
-
-    # 5-year avg weekly delta (line)
     fig_delta.add_trace(go.Scatter(
         x=recent['period'],
         y=recent['delta_5y_avg'],
@@ -341,9 +378,8 @@ if storage_df is not None:
         name='5yr Avg Weekly Δ',
         line=dict(color='black', dash='dash')
     ))
-
     fig_delta.update_layout(
-        title="Weekly Injection/Withdrawal vs 5-Year Average",
+        title=f"{selected_region}: Weekly Injection/Withdrawal vs 5-Year Average",
         xaxis_title="Date",
         yaxis_title="Bcf",
         height=400,
@@ -352,7 +388,7 @@ if storage_df is not None:
     )
     st.plotly_chart(fig_delta, use_container_width=True)
 
-    # --- 2C. Deviation & Z-Score (compact view) ---
+    # --- 2C. Deviation & Z-Score ---
     c1, c2 = st.columns(2)
 
     with c1:
@@ -364,7 +400,7 @@ if storage_df is not None:
             marker_color=recent['delta_dev_vs_5y'].apply(lambda x: 'red' if x < 0 else 'green')
         ))
         fig_dev.update_layout(
-            title="Weekly Deviation vs 5-Year Avg (Bcf)",
+            title=f"{selected_region}: Weekly Deviation vs 5-Year Avg (Bcf)",
             xaxis_title="Date",
             yaxis_title="Bcf",
             height=300,
@@ -384,7 +420,7 @@ if storage_df is not None:
         fig_z.add_hline(y=1.5, line=dict(color='orange', width=1, dash='dash'))
         fig_z.add_hline(y=-1.5, line=dict(color='orange', width=1, dash='dash'))
         fig_z.update_layout(
-            title="Weekly Injection/Withdrawal Z-Score (by Week-of-Year)",
+            title=f"{selected_region}: Weekly Injection/Withdrawal Z-Score",
             xaxis_title="Date",
             yaxis_title="Z-Score",
             height=300,
@@ -394,7 +430,6 @@ if storage_df is not None:
 
     # --- 2D. Cumulative Deviation vs 5-Year Avg (Gas Year) ---
     fig_cum = go.Figure()
-    # Plot last few gas years
     for gy, sub in storage_df.groupby('gas_year'):
         if gy >= storage_df['gas_year'].max() - 4:  # last ~5 gas years
             fig_cum.add_trace(go.Scatter(
@@ -406,7 +441,7 @@ if storage_df is not None:
 
     fig_cum.add_hline(y=0, line=dict(color='black', width=1))
     fig_cum.update_layout(
-        title="Cumulative Deviation vs 5-Year Avg (by Gas Year)",
+        title=f"{selected_region}: Cumulative Deviation vs 5-Year Avg (by Gas Year)",
         xaxis_title="Date",
         yaxis_title="Cumulative Δ vs 5yr Avg (Bcf)",
         height=400,
@@ -415,7 +450,7 @@ if storage_df is not None:
     st.plotly_chart(fig_cum, use_container_width=True)
 
 else:
-    st.warning("⚠️ Could not load Lower 48 Storage Data.")
+    st.warning(f"⚠️ Could not load storage data for {selected_region}.")
 
 st.markdown("---")
 
@@ -424,13 +459,9 @@ st.subheader("3. 10-Day HDD Forecast (Gas Demand Proxy)")
 st.write("Projected Heating Degree Days (HDD) for key consumption hubs.")
 try:
     weather_df = get_weather_demand()
-
-    # Pivot for chart
     chart_data = weather_df.pivot(index='date', columns='City', values='HDD')
-
     st.line_chart(chart_data)
 
-    # Total System HDD
     total_hdd = chart_data.sum(axis=1)
     st.metric("Total System Forecast HDD (Next 10 Days)", f"{total_hdd.sum():.0f}")
 
