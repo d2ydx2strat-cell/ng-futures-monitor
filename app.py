@@ -202,19 +202,6 @@ def get_eia_series_v1(api_key: str, series_id: str, length_weeks: int = 52 * 15)
         st.error(f"EIA v1 Fetch Error for {series_id}: {e}")
         return None
 
-# ----2.a wrapper for v1 or v2 based on series ---
-def get_storage_for_region(region_name: str, length_weeks: int = 52 * 15) -> pd.DataFrame | None:
-    meta = EIA_SERIES[region_name]
-    api_type = meta["api"]
-    series_or_region = meta["id"]
-
-    if api_type == "v2":
-        return get_eia_series_v2(EIA_API_KEY, series_or_region, length_weeks=length_weeks)
-    else:
-        return get_eia_series_v1(EIA_API_KEY, series_or_region, length_weeks=length_weeks)
-
-
-
 # --- 3. DATA SOURCE: WEATHER (HDD Forecast) ---
 @st.cache_data(ttl=3600*12)  # Update weather every 12 hours
 def get_weather_demand():
@@ -566,5 +553,6 @@ try:
 
 except Exception as e:
     st.error(f"Weather data error: {e}")
+
 
 
