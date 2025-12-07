@@ -16,18 +16,19 @@ st.title("🔥 Global NG Spreads, Storage & Weather Monitor")
 
 EIA_API_KEY = "KzzwPVmMSTVCI3pQbpL9calvF4CqGgEbwWy0qqXV"
 
-# EIA weekly working gas series IDs
-# Lower 48 + 5 regions + South Central salt / non-salt
+# EIA weekly working gas series
+# For most regions we use v2 API with 'series' facet.
+# For South Central Salt / Non-Salt we fall back to v1 API (series_id).
 EIA_SERIES = {
-    "Lower 48 Total": "NW2_EPG0_SWO_R48_BCF",
-    "East": "NW2_EPG0_SWO_R31_BCF",
-    "Midwest": "NW2_EPG0_SWO_R32_BCF",
-    "Mountain": "NW2_EPG0_SWO_R33_BCF",
-    "Pacific": "NW2_EPG0_SWO_R34_BCF",
-    "South Central Total": "NW2_EPG0_SWO_R35_BCF",
-    # CORRECTED: South Central Salt / Non-Salt are region R35, not R33
-    "South Central Salt": "NW2_EPG0_SSO_R35_BCF",
-    "South Central Non-Salt": "NW2_EPG0_SNO_R35_BCF",
+    "Lower 48 Total": {"api": "v2", "id": "R48"},
+    "East": {"api": "v2", "id": "R31"},
+    "Midwest": {"api": "v2", "id": "R32"},
+    "Mountain": {"api": "v2", "id": "R33"},
+    "Pacific": {"api": "v2", "id": "R34"},
+    "South Central Total": {"api": "v2", "id": "R35"},
+    # These two use the legacy v1 API with full series_id
+    "South Central Salt": {"api": "v1", "id": "NW2_EPG0_SSO_R33_BCF"},
+    "South Central Non-Salt": {"api": "v1", "id": "NW2_EPG0_SNO_R33_BCF"},
 }
 
 # If you know working gas capacity by region, you can hardcode here (Bcf).
@@ -76,10 +77,10 @@ def get_price_data():
 # --- 2. DATA SOURCE: US STORAGE (EIA) ---
 
 @st.cache_data(ttl=3600*24)
-def get_eia_series(api_key: str, series_id: str, length_weeks: int = 52 * 15) -> pd.DataFrame | None:
+def get_eia_series_v2(api_key: str, region_code: str, length_weeks: int = 52 * 15) -> pd.DataFrame | None:
     """
-    Generic fetcher for a single EIA weekly storage series.
-    Returns DataFrame with ['period', 'value'] sorted ascending by period.
+    Fetch weekly storage from EIA v2 API using the 'series' facet.
+    region_code is something like 'R48', 'R31', 'R35', etc.
     """
     url = "https://api.eia.gov/v2/natural-gas/stor/wkly/data/"
 
@@ -87,7 +88,7 @@ def get_eia_series(api_key: str, series_id: str, length_weeks: int = 52 * 15) ->
         "api_key": api_key,
         "frequency": "weekly",
         "data[0]": "value",
-        "facets[series][]": series_id,
+        "facets[series][]": region_code,
         "sort[0][column]": "period",
         "sort[0][direction]": "desc",
         "offset": 0,
@@ -99,7 +100,7 @@ def get_eia_series(api_key: str, series_id: str, length_weeks: int = 52 * 15) ->
         data = r.json()
 
         if 'error' in data:
-            st.error(f"EIA API Error for {series_id}: {data['error']}")
+            st.error(f"EIA v2 API Error for {region_code}: {data['error']}")
             return None
 
         if 'response' in data and 'data' in data['response'] and data['response']['data']:
@@ -109,12 +110,68 @@ def get_eia_series(api_key: str, series_id: str, length_weeks: int = 52 * 15) ->
             df = df.sort_values('period').reset_index(drop=True)
             return df
         else:
-            st.error(f"EIA Structure Error: API returned empty data for series {series_id}.")
+            st.error(f"EIA v2 Structure Error: API returned empty data for region {region_code}.")
             return None
 
     except Exception as e:
-        st.error(f"EIA Fetch Error for {series_id}: {e}")
+        st.error(f"EIA v2 Fetch Error for {region_code}: {e}")
         return None
+
+
+@st.cache_data(ttl=3600*24)
+def get_eia_series_v1(api_key: str, series_id: str, length_weeks: int = 52 * 15) -> pd.DataFrame | None:
+    """
+    Fetch weekly storage from EIA v1 API using full series_id
+    (e.g., NW2_EPG0_SSO_R33_BCF for South Central Salt).
+    """
+    url = "https://api.eia.gov/series/"
+
+    params = {
+        "api_key": api_key,
+        "series_id": series_id,
+    }
+
+    try:
+        r = requests.get(url, params=params)
+        data = r.json()
+
+        if 'error' in data:
+            st.error(f"EIA v1 API Error for {series_id}: {data['error']}")
+            return None
+
+        if 'series' in data and data['series']:
+            s = data['series'][0]
+            # s['data'] is list of [date, value] with date as YYYYMMDD or YYYYMM
+            rows = s['data']
+            df = pd.DataFrame(rows, columns=['period_raw', 'value'])
+            # Weekly storage uses YYYYMMDD
+            df['period'] = pd.to_datetime(df['period_raw'], format='%Y%m%d')
+            df['value'] = pd.to_numeric(df['value'])
+            df = df.sort_values('period').reset_index(drop=True)
+            # Optionally trim to last N weeks
+            if len(df) > length_weeks:
+                df = df.tail(length_weeks).reset_index(drop=True)
+            return df
+        else:
+            st.error(f"EIA v1 Structure Error: no series data for {series_id}.")
+            return None
+
+    except Exception as e:
+        st.error(f"EIA v1 Fetch Error for {series_id}: {e}")
+        return None
+
+# ----2.a wrapper for v1 or v2 based on series ---
+def get_storage_for_region(region_name: str, length_weeks: int = 52 * 15) -> pd.DataFrame | None:
+    meta = EIA_SERIES[region_name]
+    api_type = meta["api"]
+    series_or_region = meta["id"]
+
+    if api_type == "v2":
+        return get_eia_series_v2(EIA_API_KEY, series_or_region, length_weeks=length_weeks)
+    else:
+        return get_eia_series_v1(EIA_API_KEY, series_or_region, length_weeks=length_weeks)
+
+
 
 # --- 3. DATA SOURCE: WEATHER (HDD Forecast) ---
 @st.cache_data(ttl=3600*12)  # Update weather every 12 hours
@@ -260,10 +317,8 @@ region_names = list(EIA_SERIES.keys())
 default_region = "Lower 48 Total"
 selected_region = st.selectbox("Select Region / South Central Detail", region_names, index=region_names.index(default_region))
 
-series_id = EIA_SERIES[selected_region]
 capacity_bcf = REGION_CAPACITY_BCF.get(selected_region)
-
-storage_df = get_eia_series(EIA_API_KEY, series_id)
+storage_df = get_storage_for_region(selected_region)
 
 if storage_df is not None and not storage_df.empty:
     # Compute analytics on FULL history
@@ -469,3 +524,4 @@ try:
 
 except Exception as e:
     st.error(f"Weather data error: {e}")
+
