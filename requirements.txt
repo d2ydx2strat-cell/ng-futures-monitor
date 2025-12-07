@@ -1,0 +1,8 @@
+streamlit
+pandas
+yfinance
+requests
+openmeteo-requests
+requests-cache
+retry-requests
+plotly
