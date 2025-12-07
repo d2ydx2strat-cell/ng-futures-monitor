@@ -16,22 +16,18 @@ st.title("🔥 Global NG Spreads, Storage & Weather Monitor")
 
 EIA_API_KEY = "KzzwPVmMSTVCI3pQbpL9calvF4CqGgEbwWy0qqXV"
 
-# EIA weekly working gas series
-# For most regions we use v2 API with 'series' facet.
-# For South Central Salt / Non-Salt we fall back to v1 API (series_id).
+# EIA weekly working gas series (v1 API)
 EIA_SERIES = {
-    "Lower 48 Total": {"api": "v2", "id": "R48"},
-    "East": {"api": "v2", "id": "R31"},
-    "Midwest": {"api": "v2", "id": "R32"},
-    "Mountain": {"api": "v2", "id": "R33"},
-    "Pacific": {"api": "v2", "id": "R34"},
-    "South Central Total": {"api": "v2", "id": "R35"},
-    # These two use the legacy v1 API with full series_id
-    "South Central Salt": {"api": "v1", "id": "NW2_EPG0_SSO_R33_BCF"},
-    "South Central Non-Salt": {"api": "v1", "id": "NW2_EPG0_SNO_R33_BCF"},
+    "Lower 48 Total":         {"api": "v1", "id": "NG.W_EPG0_SWO_R48_BCF.W"},
+    "East":                   {"api": "v1", "id": "NG.W_EPG0_SWO_R31_BCF.W"},
+    "Midwest":                {"api": "v1", "id": "NG.W_EPG0_SWO_R32_BCF.W"},
+    "Mountain":               {"api": "v1", "id": "NG.W_EPG0_SWO_R33_BCF.W"},
+    "Pacific":                {"api": "v1", "id": "NG.W_EPG0_SWO_R34_BCF.W"},
+    "South Central Total":    {"api": "v1", "id": "NG.W_EPG0_SWO_R35_BCF.W"},
+    "South Central Salt":     {"api": "v1", "id": "NG.W_EPG0_SSO_R35_BCF.W"},
+    "South Central Non-Salt": {"api": "v1", "id": "NG.W_EPG0_SNO_R35_BCF.W"},
 }
 
-# If you know working gas capacity by region, you can hardcode here (Bcf).
 REGION_CAPACITY_BCF = {
     "Lower 48 Total": None,
     "East": None,
@@ -42,6 +38,52 @@ REGION_CAPACITY_BCF = {
     "South Central Salt": None,
     "South Central Non-Salt": None,
 }
+
+@st.cache_data(ttl=3600*24)
+def get_eia_series_v1(api_key: str, series_id: str, length_weeks: int = 52 * 15) -> pd.DataFrame | None:
+    """
+    Fetch weekly storage from EIA v1 API using full series_id
+    (e.g., NG.W_EPG0_SWO_R48_BCF.W).
+    """
+    url = "https://api.eia.gov/series/"
+
+    params = {
+        "api_key": api_key,
+        "series_id": series_id,
+    }
+
+    try:
+        r = requests.get(url, params=params)
+        data = r.json()
+
+        if 'error' in data:
+            st.error(f"EIA v1 API Error for {series_id}: {data['error']}")
+            return None
+
+        if 'series' in data and data['series']:
+            s = data['series'][0]
+            rows = s['data']  # list of [date, value]
+            df = pd.DataFrame(rows, columns=['period_raw', 'value'])
+            # Weekly storage uses YYYYMMDD
+            df['period'] = pd.to_datetime(df['period_raw'], format='%Y%m%d')
+            df['value'] = pd.to_numeric(df['value'])
+            df = df.sort_values('period').reset_index(drop=True)
+            if len(df) > length_weeks:
+                df = df.tail(length_weeks).reset_index(drop=True)
+            return df
+        else:
+            st.error(f"EIA v1 Structure Error: no series data for {series_id}.")
+            return None
+
+    except Exception as e:
+        st.error(f"EIA v1 Fetch Error for {series_id}: {e}")
+        return None
+
+
+def get_storage_for_region(region_name: str, length_weeks: int = 52 * 15) -> pd.DataFrame | None:
+    meta = EIA_SERIES[region_name]
+    series_id = meta["id"]
+    return get_eia_series_v1(EIA_API_KEY, series_id, length_weeks=length_weeks)
 
 # Sidebar
 with st.sidebar:
@@ -524,4 +566,5 @@ try:
 
 except Exception as e:
     st.error(f"Weather data error: {e}")
+
 
