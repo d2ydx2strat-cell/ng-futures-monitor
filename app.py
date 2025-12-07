@@ -74,7 +74,7 @@ def get_eia_storage(api_key):
         "data[0]": "value", 
         
         # FIX: The necessary Series ID filter passed as a facet
-        "facets[series][]": "NG.N3035_EPG0_SWO_2_BCF.W",
+        "facets[series][]": "NG.N3035_EPG0_SWO_2_BCF",
         
         # FIX: Simplified sorting to avoid encoding conflicts
         "sort[0][column]": "period", 
@@ -243,6 +243,7 @@ try:
 except Exception as e:
 
     st.error(f"Weather data error: {e}")
+
 
 
 
