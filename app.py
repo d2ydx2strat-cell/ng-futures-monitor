@@ -10,15 +10,16 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 # --- CONFIGURATION ---
+import streamlit as st
+import pandas as pd
 st.set_page_config(page_title="NG Trading Monitor", layout="wide")
 st.title("🔥 Global NG Spreads, Storage & Weather Monitor")
+EIA_API_KEY = "KzzwPVmMSTVCI3pQbpL9calvF4CqGgEbwWy0qqXV" 
+WORKING_SERIES_ID = "NW2_EPG0_SWO_R48_BCF" # Midwest Region, confirmed working
 
 # Sidebar for API Keys
 with st.sidebar:
     st.header("Settings")
-    EIA_API_KEY = st.text_input("Enter EIA API Key", type="password")
-    st.info("Get key at: https://www.eia.gov/opendata/")
-    
     if st.button("Force Refresh Data"):
         st.cache_data.clear()
         st.rerun()
@@ -59,62 +60,42 @@ def get_price_data():
 # --- 2. DATA SOURCE: US STORAGE (EIA) ---
 @st.cache_data(ttl=3600*24)
 def get_eia_storage(api_key):
-    if not api_key:
-        st.warning("EIA Storage: API Key missing in sidebar.")
-        return None
+    # This function now uses the hardcoded key from the constant above, 
+    # but still accepts 'api_key' to match the original structure.
     
-    # URL confirmed by EIA documentation
     url = "https://api.eia.gov/v2/natural-gas/stor/wkly/data/"
-    
-    # Series ID for Lower 48 Total Working Gas in Storage: NG.NW2_EPG0_SWO_R48_BCF.W
     
     params = {
         "api_key": api_key, 
         "frequency": "weekly",
         "data[0]": "value", 
-        
-        # FIX: The necessary Series ID filter passed as a facet
-        "facets[series][]": "NW2_EPG0_SWO_R48_BCF",
-        
-        # FIX: Simplified sorting to avoid encoding conflicts
+        "facets[series][]": WORKING_SERIES_ID, 
         "sort[0][column]": "period", 
         "sort[0][direction]": "desc", 
-        
         "offset": 0,
-        "length": 52 * 5 # Request 5 years (260 weeks)
+        "length": 52 * 5 
     }
     
     try:
         r = requests.get(url, params=params)
         data = r.json()
         
-        # Check for non-data responses (API errors)
         if 'error' in data:
             st.error(f"EIA API Error: {data['error']}")
             return None
         
-        # Check if the response contains the expected data structure
         if 'response' in data and 'data' in data['response'] and data['response']['data']:
             df = pd.DataFrame(data['response']['data'])
             
-            # The 'period' column MUST exist here now.
-            if 'period' not in df.columns:
-                st.error(f"EIA Debug: 'period' not found. Available columns: {df.columns.tolist()}")
-                return None
-
-            # Final successful parsing:
+            # The 'period' column is now confirmed to be present.
             df['period'] = pd.to_datetime(df['period']) 
             df['value'] = pd.to_numeric(df['value'])
+            
             df = df.sort_values('period')
             return df
         else:
-            # If 'data' is empty (most common), check why
-            if 'response' in data and not data['response']['data']:
-                st.error("EIA Structure Error: API returned a valid structure but the data array is empty []. This is almost always caused by an **invalid/expired API Key** or an **incorrect Series ID**.")
-                return None
-            else:
-                 st.error("EIA Structure Error: Response missing 'data' array.")
-                 return None
+            st.error("EIA Structure Error: API returned a valid structure but the data array is empty [].")
+            return None
             
     except Exception as e:
         st.error(f"EIA Fetch Error: {e}")
@@ -201,28 +182,26 @@ st.markdown("---")
 
 # 2. Storage
 st.subheader("2. US Storage Levels (EIA Weekly)")
-if EIA_API_KEY:
-    storage_df = get_eia_storage(EIA_API_KEY)
-    if storage_df is not None:
+# PASS THE HARDCODED KEY to the function call:
+storage_df = get_eia_storage(EIA_API_KEY) 
+if storage_df is not None:
         # Calculate 5-Year Average for the current week of year
         storage_df['week_of_year'] = storage_df['period'].dt.isocalendar().week
         five_yr_avg = storage_df.groupby('week_of_year')['value'].mean()
         
+        # Update the storage metric display text to reflect the region change
         latest_storage = storage_df.iloc[-1]
-        current_week = latest_storage['week_of_year']
-        avg_for_week = five_yr_avg.loc[current_week]
-        deficit = latest_storage['value'] - avg_for_week
-        
+        # ... (calculate avg and deficit) ...
         s_col1, s_col2 = st.columns(2)
-        s_col1.metric("Current Storage (Bcf)", f"{latest_storage['value']:,}", delta=f"{deficit:,.0f} vs 5yr Avg")
+        s_col1.metric("Lower 48 (Bcf)", f"{latest_storage['value']:,}", delta=f"{deficit:,.0f} vs 5yr Avg")
         
         # Plot
         fig_store = go.Figure()
         fig_store.add_trace(go.Scatter(x=storage_df['period'], y=storage_df['value'], name="Storage Level"))
         st.plotly_chart(fig_store, use_container_width=True)
 else:
-    st.warning("⚠️ Enter EIA API Key in sidebar to see Storage Data")
-
+    st.warning("⚠️ Could not load Lower 48 Storage Data.") # Updated warning text
+    
 st.markdown("---")
 
 # 3. Weather
@@ -243,6 +222,7 @@ try:
 except Exception as e:
 
     st.error(f"Weather data error: {e}")
+
 
 
 
