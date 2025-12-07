@@ -245,26 +245,45 @@ if storage_df is not None and not storage_df.empty:
     storage_df = compute_storage_analytics(storage_df)
     latest_storage = storage_df.iloc[-1]
 
-    current_level = latest_storage['value']
+        current_level = latest_storage['value']
     current_delta = latest_storage['delta']
     level_5y_avg = latest_storage['level_5y_avg']
     delta_5y_avg = latest_storage['delta_5y_avg']
-    level_deficit = current_level - level_5y_avg
-    delta_deficit = current_delta - delta_5y_avg
     level_z = latest_storage['level_zscore']
 
+    # Compute deficits, but handle NaNs safely
+    level_deficit = current_level - level_5y_avg if pd.notna(level_5y_avg) else None
+    delta_deficit = current_delta - delta_5y_avg if pd.notna(delta_5y_avg) else None
+
+    if level_deficit is not None and pd.notna(level_deficit):
+        level_deficit_str = f"{level_deficit:,.0f} vs 5yr Avg"
+    else:
+        level_deficit_str = "vs 5yr Avg (insufficient history)"
+
+    if delta_deficit is not None and pd.notna(delta_deficit):
+        delta_deficit_str = f"{delta_deficit:,.0f} vs 5yr Avg"
+    else:
+        delta_deficit_str = "vs 5yr Avg (insufficient history)"
+
     s_col1, s_col2, s_col3, s_col4 = st.columns(4)
-    s_col1.metric(f"{selected_region} Working Gas (Bcf)",
-                  f"{current_level:,.0f}",
-                  delta=f"{level_deficit:,.0f} vs 5yr Avg")
+    s_col1.metric(
+        f"{selected_region} Working Gas (Bcf)",
+        f"{current_level:,.0f}",
+        delta=level_deficit_str
+    )
 
-    s_col2.metric("Weekly Change (Bcf)",
-                  f"{current_delta:,.0f}",
-                  delta=f"{delta_deficit:,.0f} vs 5yr Avg")
+    s_col2.metric(
+        "Weekly Change (Bcf)",
+        f"{current_delta:,.0f}" if pd.notna(current_delta) else "N/A",
+        delta=delta_deficit_str
+    )
 
-    s_col3.metric("Storage Level Z-Score",
-                  f"{level_z:.2f}" if pd.notna(level_z) else "N/A",
-                  delta="vs hist. week-of-year")
+    s_col3.metric(
+        "Storage Level Z-Score",
+        f"{level_z:.2f}" if pd.notna(level_z) else "N/A",
+        delta="vs hist. week-of-year"
+    )
+
 
     if capacity_bcf is not None:
         pct_full = current_level / capacity_bcf * 100
@@ -435,3 +454,4 @@ try:
 
 except Exception as e:
     st.error(f"Weather data error: {e}")
+
