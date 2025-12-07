@@ -245,7 +245,7 @@ if storage_df is not None and not storage_df.empty:
     storage_df = compute_storage_analytics(storage_df)
     latest_storage = storage_df.iloc[-1]
 
-        current_level = latest_storage['value']
+    current_level = latest_storage['value']
     current_delta = latest_storage['delta']
     level_5y_avg = latest_storage['level_5y_avg']
     delta_5y_avg = latest_storage['delta_5y_avg']
@@ -454,4 +454,5 @@ try:
 
 except Exception as e:
     st.error(f"Weather data error: {e}")
+
 
