@@ -8,14 +8,17 @@ import pandas as pd
 from datetime import datetime
 
 # --- CONFIG ---
-EIA_KEY = os.environ.get("EIA_API_KEY")
+# Hardcoded Key as requested.
+EIA_KEY = "KzzwPVmMSTVCI3pQbpL9calvF4CqGgEbwWy0qqXV" 
+
+# These remain as GitHub Secrets for security (EMAIL_USER, EMAIL_PASS)
 EMAIL_SENDER = os.environ.get("EMAIL_USER")
 EMAIL_PASSWORD = os.environ.get("EMAIL_PASS")
 EMAIL_RECEIVER = os.environ.get("EMAIL_USER") # Sending to yourself
 
 def get_market_data():
+    """Fetches NG futures, TTF futures, and FX data."""
     try:
-        # Fetch Henry Hub and TTF Proxy
         tickers = ['NG=F', 'TTF=F', 'EURUSD=X']
         df = yf.download(tickers, period="5d", interval="1d")['Close']
         
@@ -23,7 +26,7 @@ def get_market_data():
         last_ttf_eur = df['TTF=F'].iloc[-1]
         fx = df['EURUSD=X'].iloc[-1]
         
-        # Convert TTF to USD/MMBtu
+        # Convert TTF (EUR/MWh) to USD/MMBtu (using 3.412 conversion factor)
         last_ttf_usd = (last_ttf_eur * fx) / 3.412
         spread = last_ttf_usd - last_hh
         
@@ -32,27 +35,44 @@ def get_market_data():
         return 0, 0, 0
 
 def get_storage_data():
-    if not EIA_KEY: return "No API Key"
+    """Fetches Weekly Midwest Region Storage Data from EIA."""
+    if not EIA_KEY: 
+        return "No API Key"
+        
+    url = "https://api.eia.gov/v2/natural-gas/stor/wkly/data/"
+    
+    # CONFIRMED WORKING & SIMPLIFIED SERIES ID: Midwest Region
+    WORKING_SERIES_ID = "NW2_EPG0_SWO_R32_BCF"
+
+    params = {
+        "api_key": EIA_KEY, 
+        "frequency": "weekly",
+        "data[0]": "value", 
+        "facets[series][]": WORKING_SERIES_ID, 
+        "sort[0][column]": "period", 
+        "sort[0][direction]": "desc", 
+        "offset": 0,
+        "length": 1 # Fetch only the single latest record
+    }
+    
     try:
-        url = "https://api.eia.gov/v2/natural-gas/stor/wkly/data/"
-        params = {
-            "api_key": EIA_KEY,
-            "frequency": "weekly",
-            "data[0]": "value",
-            "facets[series][]": "NG.NW2_EPG0_SWO_R48_BCF.W",
-            "sort[0][column]": "period",
-            "sort[0][direction]": "desc",
-            "length": 1
-        }
         r = requests.get(url, params=params).json()
-        val = r['response']['data'][0]['value']
-        return f"{val} Bcf"
-    except:
-        return "Fetch Error"
+        
+        if 'error' in r:
+            return f"EIA Error: {r['error']}"
+        
+        if 'response' in r and 'data' in r['response'] and r['response']['data']:
+            val = r['response']['data'][0]['value']
+            return f"{val} Bcf (Midwest)"
+        else:
+            return "Fetch Error (Data Empty)"
+    except Exception as e:
+        return f"Fetch Error: {e}"
 
 def get_weather_outlook():
-    # Simple check for Chicago (Midwest Proxy)
+    """Calculates 7-day Heating Degree Days (HDD) for Chicago (Midwest Proxy)."""
     try:
+        # Simple check for Chicago (Midwest Proxy)
         url = "https://api.open-meteo.com/v1/forecast?latitude=41.85&longitude=-87.62&daily=temperature_2m_mean&forecast_days=7"
         r = requests.get(url).json()
         temps = r['daily']['temperature_2m_mean']
@@ -69,6 +89,7 @@ def get_weather_outlook():
         return "N/A"
 
 def send_email():
+    """Gathers all data and sends the formatted email."""
     hh, ttf, spread = get_market_data()
     storage = get_storage_data()
     weather = get_weather_outlook()
@@ -87,7 +108,7 @@ def send_email():
     Spread:      ${spread:.2f} 
     (Spread > $8 usually supports max LNG exports)
 
-    2. STORAGE (Lower 48)
+    2. STORAGE 
     Latest Level: {storage}
     
     3. WEATHER (Demand Proxy)
@@ -97,6 +118,10 @@ def send_email():
     Sent automatically via GitHub Actions
     """
 
+    if not EMAIL_SENDER or not EMAIL_PASSWORD:
+        print("ERROR: Email user or password is not set in environment variables.")
+        return
+
     msg = EmailMessage()
     msg.set_content(body)
     msg['Subject'] = subject
@@ -104,11 +129,13 @@ def send_email():
     msg['To'] = EMAIL_RECEIVER
 
     context = ssl.create_default_context()
-    with smtplib.SMTP_SSL('smtp.gmail.com', 465, context=context) as smtp:
-        smtp.login(EMAIL_SENDER, EMAIL_PASSWORD)
-        smtp.send_message(msg)
-    
-    print("Email Sent Successfully")
+    try:
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465, context=context) as smtp:
+            smtp.login(EMAIL_SENDER, EMAIL_PASSWORD)
+            smtp.send_message(msg)
+        print("Email Sent Successfully")
+    except Exception as e:
+        print(f"Email Sending Failed: {e}")
 
 if __name__ == "__main__":
     send_email()
