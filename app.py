@@ -25,7 +25,7 @@ EIA_SERIES = {
     "Mountain": "NW2_EPG0_SWO_R33_BCF",
     "Pacific": "NW2_EPG0_SWO_R34_BCF",
     "South Central Total": "NW2_EPG0_SWO_R35_BCF",
-    "South Central Salt": "NW2_EPG0_SWO_R35S_BCF",
+    "South Central Salt": "NW2_EPG0_SSO_R33_BCF",
     "South Central Non-Salt": "NW2_EPG0_SWO_R35N_BCF",
 }
 
@@ -471,4 +471,5 @@ try:
 
 except Exception as e:
     st.error(f"Weather data error: {e}")
+
 
