@@ -26,7 +26,7 @@ EIA_SERIES = {
     "Pacific": "NW2_EPG0_SWO_R34_BCF",
     "South Central Total": "NW2_EPG0_SWO_R35_BCF",
     "South Central Salt": "NW2_EPG0_SSO_R33_BCF",
-    "South Central Non-Salt": "NW2_EPG0_SWO_R35N_BCF",
+    "South Central Non-Salt": "NW2_EPG0_SNO_R35N_BCF",
 }
 
 # If you know working gas capacity by region, you can hardcode here (Bcf).
@@ -471,5 +471,6 @@ try:
 
 except Exception as e:
     st.error(f"Weather data error: {e}")
+
 
 
