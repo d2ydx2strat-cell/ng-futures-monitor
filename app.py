@@ -63,44 +63,51 @@ def get_eia_storage(api_key):
         st.warning("EIA Storage: API Key missing in sidebar.")
         return None
     
-    # Use the specific endpoint URL structure for weekly storage data
+    # URL confirmed by EIA documentation
     url = "https://api.eia.gov/v2/natural-gas/stor/wkly/data/"
     
-    # New, simplified parameters focusing on the essential data series
+    # Lower 48 Total Working Gas in Storage Series ID: NG.NW2_EPG0_SWO_R48_BCF.W
+    # This ID MUST be passed as a facet filter, not a separate parameter.
+    
     params = {
-        "api_key": api_key,
-        "frequency": "weekly",
+        "api_key": api_key, # Valid
+        "frequency": "weekly", # Valid
+        "data[0]": "value", # Valid (Only 'value' is allowed)
         
-        # This is the Series ID for Lower 48 Total Working Gas in Storage.
-        # This ID is the key to fetching the data.
-        "series_id": "NG.NW2_EPG0_SWO_R48_BCF.W", 
+        # FIX: Explicitly request the Series ID using the facets parameter
+        "facets[series][]": "NG.NW2_EPG0_SWO_R48_BCF.W",
         
-        "data[0]": "value",   
-        "sort[0][column]": "period",
-        "sort[0][direction]": "desc",
-        "offset": 0,
-        "length": 52 * 5 # Request 5 years (260 weeks)
+        "sort[0][column]": "period", # Valid
+        "sort[0][direction]": "desc", # Valid
+        "offset": 0, # Valid
+        "length": 52 * 5 # Request 5 years (260 weeks) - Valid parameter name
     }
     
     try:
         r = requests.get(url, params=params)
         data = r.json()
         
-        # Check if the response contains the actual data payload
+        # Check for error structures defined by the EIA API
+        if 'error' in data:
+            st.error(f"EIA API Error: {data['error']}")
+            return None
+        
         if 'response' in data and 'data' in data['response']:
             df = pd.DataFrame(data['response']['data'])
             
-            # Diagnostic Check (Remove once fixed)
-            # st.error(f"EIA Debug: 'period' not found. Available columns: {df.columns.tolist()}.")
-            
-            # The column is almost certainly named 'period' once data is successfully returned
+            # The 'period' column MUST exist here now, as the data filter is fixed.
+            if 'period' not in df.columns:
+                 # This should only happen if the series ID is bad and returns a malformed response
+                st.error(f"EIA Debug: 'period' not found. Available columns: {df.columns.tolist()}")
+                return None
+
+            # Final successful parsing:
             df['period'] = pd.to_datetime(df['period']) 
             df['value'] = pd.to_numeric(df['value'])
             df = df.sort_values('period')
             return df
         else:
-            # If the structure is wrong, print the full response for advanced debugging
-            st.error(f"EIA Structure Error or Invalid Key. Full API Response: {data.get('error') or data.get('fault') or 'Check logs.'}")
+            st.error("EIA Structure Error or Invalid Key (Final Check). Response missing 'data' array.")
             return None
             
     except Exception as e:
@@ -230,6 +237,7 @@ try:
 except Exception as e:
 
     st.error(f"Weather data error: {e}")
+
 
 
 
