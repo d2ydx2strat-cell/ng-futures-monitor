@@ -60,51 +60,52 @@ def get_price_data():
 @st.cache_data(ttl=3600*24)
 def get_eia_storage(api_key):
     if not api_key:
+        st.warning("EIA Storage: API Key missing in sidebar.")
         return None
     
-    # EIA API v2 Endpoint for Natural Gas Storage
+    # Use the specific endpoint URL structure for weekly storage data
     url = "https://api.eia.gov/v2/natural-gas/stor/wkly/data/"
+    
+    # New, simplified parameters focusing on the essential data series
     params = {
         "api_key": api_key,
         "frequency": "weekly",
-        "data[0]": "value",   # Revert to only value
-        "facets[series][]": "NG.NW2_EPG0_SWO_R48_BCF.W",
+        
+        # This is the Series ID for Lower 48 Total Working Gas in Storage.
+        # This ID is the key to fetching the data.
+        "series_id": "NG.NW2_EPG0_SWO_R48_BCF.W", 
+        
+        "data[0]": "value",   
         "sort[0][column]": "period",
         "sort[0][direction]": "desc",
         "offset": 0,
-        "length": 1
+        "length": 52 * 5 # Request 5 years (260 weeks)
     }
     
     try:
         r = requests.get(url, params=params)
         data = r.json()
+        
+        # Check if the response contains the actual data payload
         if 'response' in data and 'data' in data['response']:
             df = pd.DataFrame(data['response']['data'])
-            # --- DIAGNOSTIC CODE START ---
-    # 1. Print all column names returned by the API
-            print("EIA DataFrame Columns:", df.columns.tolist()) 
-
-    # 2. Check if 'period' is one of them. If not, print the error and the columns in the Streamlit UI
-            if 'period' not in df.columns:
-                st.error(f"EIA Debug: 'period' not found. Available columns: {df.columns.tolist()}.")
-        # Attempt a common fix: rename if it's capitalized
-                if 'Period' in df.columns:
-                    df.rename(columns={'Period': 'period'}, inplace=True)
-                    st.info("EIA Debug: Renamed 'Period' to 'period'.")
-                else:
-                    return None # Exit if the required column is truly missing
-    # --- DIAGNOSTIC CODE END ---
-            df['period'] = pd.to_datetime(df['period'])
+            
+            # Diagnostic Check (Remove once fixed)
+            # st.error(f"EIA Debug: 'period' not found. Available columns: {df.columns.tolist()}.")
+            
+            # The column is almost certainly named 'period' once data is successfully returned
+            df['period'] = pd.to_datetime(df['period']) 
             df['value'] = pd.to_numeric(df['value'])
             df = df.sort_values('period')
             return df
         else:
-            st.error("EIA Data structure changed or Key Invalid")
+            # If the structure is wrong, print the full response for advanced debugging
+            st.error(f"EIA Structure Error or Invalid Key. Full API Response: {data.get('error') or data.get('fault') or 'Check logs.'}")
             return None
+            
     except Exception as e:
         st.error(f"EIA Fetch Error: {e}")
         return None
-
 # --- 3. DATA SOURCE: WEATHER (HDD Forecast) ---
 @st.cache_data(ttl=3600*12) # Update weather every 12 hours
 def get_weather_demand():
@@ -229,6 +230,7 @@ try:
 except Exception as e:
 
     st.error(f"Weather data error: {e}")
+
 
 
 
