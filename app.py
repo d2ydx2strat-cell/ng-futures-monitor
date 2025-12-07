@@ -82,17 +82,17 @@ def get_eia_storage(api_key):
             df = pd.DataFrame(data['response']['data'])
             # --- DIAGNOSTIC CODE START ---
     # 1. Print all column names returned by the API
-    print("EIA DataFrame Columns:", df.columns.tolist()) 
+            print("EIA DataFrame Columns:", df.columns.tolist()) 
 
     # 2. Check if 'period' is one of them. If not, print the error and the columns in the Streamlit UI
-    if 'period' not in df.columns:
-        st.error(f"EIA Debug: 'period' not found. Available columns: {df.columns.tolist()}.")
+            if 'period' not in df.columns:
+                st.error(f"EIA Debug: 'period' not found. Available columns: {df.columns.tolist()}.")
         # Attempt a common fix: rename if it's capitalized
-        if 'Period' in df.columns:
-            df.rename(columns={'Period': 'period'}, inplace=True)
-            st.info("EIA Debug: Renamed 'Period' to 'period'.")
-        else:
-            return None # Exit if the required column is truly missing
+                if 'Period' in df.columns:
+                    df.rename(columns={'Period': 'period'}, inplace=True)
+                    st.info("EIA Debug: Renamed 'Period' to 'period'.")
+                else:
+                    return None # Exit if the required column is truly missing
     # --- DIAGNOSTIC CODE END ---
             df['period'] = pd.to_datetime(df['period'])
             df['value'] = pd.to_numeric(df['value'])
@@ -229,6 +229,7 @@ try:
 except Exception as e:
 
     st.error(f"Weather data error: {e}")
+
 
 
 
