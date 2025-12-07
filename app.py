@@ -17,7 +17,7 @@ st.title("🔥 Global NG Spreads, Storage & Weather Monitor")
 EIA_API_KEY = "KzzwPVmMSTVCI3pQbpL9calvF4CqGgEbwWy0qqXV"
 
 # EIA weekly working gas series IDs
-# These are standard Lower 48 + 5 regions + South Central salt / non-salt
+# Lower 48 + 5 regions + South Central salt / non-salt
 EIA_SERIES = {
     "Lower 48 Total": "NW2_EPG0_SWO_R48_BCF",
     "East": "NW2_EPG0_SWO_R31_BCF",
@@ -25,12 +25,12 @@ EIA_SERIES = {
     "Mountain": "NW2_EPG0_SWO_R33_BCF",
     "Pacific": "NW2_EPG0_SWO_R34_BCF",
     "South Central Total": "NW2_EPG0_SWO_R35_BCF",
-    "South Central Salt": "NW2_EPG0_SSO_R33_BCF",
-    "South Central Non-Salt": "NW2_EPG0_SNO_R33_BCF",
+    # CORRECTED: South Central Salt / Non-Salt are region R35, not R33
+    "South Central Salt": "NW2_EPG0_SSO_R35_BCF",
+    "South Central Non-Salt": "NW2_EPG0_SNO_R35_BCF",
 }
 
 # If you know working gas capacity by region, you can hardcode here (Bcf).
-# For now, leave as None; logic will handle missing capacity.
 REGION_CAPACITY_BCF = {
     "Lower 48 Total": None,
     "East": None,
@@ -433,7 +433,6 @@ if storage_df is not None and not storage_df.empty:
         st.plotly_chart(fig_z, use_container_width=True)
 
     # --- 2D. Cumulative Deviation vs 5-Year Avg (Gas Year) ---
-    # This is already limited to last ~5 gas years; keep as-is
     fig_cum = go.Figure()
     for gy, sub in storage_df.groupby('gas_year'):
         if gy >= storage_df['gas_year'].max() - 4:  # last ~5 gas years
@@ -457,7 +456,6 @@ if storage_df is not None and not storage_df.empty:
 else:
     st.warning(f"⚠️ Could not load storage data for {selected_region}.")
 
-
 # 3. Weather
 st.subheader("3. 10-Day HDD Forecast (Gas Demand Proxy)")
 st.write("Projected Heating Degree Days (HDD) for key consumption hubs.")
@@ -471,7 +469,3 @@ try:
 
 except Exception as e:
     st.error(f"Weather data error: {e}")
-
-
-
-
