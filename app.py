@@ -294,13 +294,13 @@ s_col3.metric(
 
 
 
-    if capacity_bcf is not None:
-        pct_full = current_level / capacity_bcf * 100
-        s_col4.metric("Utilization (% of Capacity)",
+if capacity_bcf is not None:
+    pct_full = current_level / capacity_bcf * 100
+    s_col4.metric("Utilization (% of Capacity)",
                       f"{pct_full:.1f}%",
                       delta=None)
-    else:
-        s_col4.metric("Utilization (% of Capacity)", "N/A", delta=None)
+else:
+    s_col4.metric("Utilization (% of Capacity)", "N/A", delta=None)
 
     # Limit display to last 2 years
     display_window_weeks = 52 * 2
@@ -463,6 +463,7 @@ try:
 
 except Exception as e:
     st.error(f"Weather data error: {e}")
+
 
 
 
