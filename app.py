@@ -433,6 +433,48 @@ def create_satellite_map(gdf_pipelines: gpd.GeoDataFrame, gdf_boundary: gpd.GeoD
         )
     )
 
+        # Build Mapbox layers ---------------------------
+    try:
+        boundary_json = gdf_boundary_4326.__geo_interface__
+    except Exception:
+        boundary_json = None
+
+    layers = []
+    if boundary_json:
+        # Transparent fill
+        layers.append(
+            {
+                "source": boundary_json,
+                "type": "fill",
+                "color": "rgba(0, 255, 0, 0)"  # invisible fill
+            }
+        )
+        # Yellow outline
+        layers.append(
+            {
+                "source": boundary_json,
+                "type": "line",
+                "color": "yellow",
+                "line": {"width": 2}
+            }
+        )
+
+    # Map layout (THIS IS THE FIX)
+    fig.update_layout(
+        mapbox=dict(
+            style="satellite-streets-v12",   # ← REQUIRED on Streamlit Cloud
+            accesstoken=mapbox_token,        # ← MUST be inside mapbox={}
+            center=dict(lat=center_lat, lon=center_lon),
+            zoom=4,
+            layers=layers,
+        ),
+        margin=dict(l=0, r=0, t=0, b=0),
+        height=700,
+        showlegend=False,
+    )
+
+    return fig
+
     # Boundary: separate fill + outline (Mapbox GL compliant)
     try:
         boundary_geo = gdf_boundary_4326.__geo_interface__
@@ -479,3 +521,4 @@ else:
     st.info("Pipeline map not available. Upload the shapefile components to the app directory and reload.")
 
 # End of app
+
