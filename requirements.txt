@@ -6,3 +6,6 @@ openmeteo-requests
 requests-cache
 retry-requests
 plotly
+numpy
+geopandas
+matplotlib
