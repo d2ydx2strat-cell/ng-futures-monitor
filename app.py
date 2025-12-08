@@ -3,7 +3,6 @@ import pandas as pd
 import yfinance as yf
 import requests
 import datetime
-# openmeteo_requests and retry_requests are third-party libs you already used
 import openmeteo_requests
 import requests_cache
 from retry_requests import retry
@@ -19,7 +18,8 @@ from shapely.geometry import box
 st.set_page_config(page_title="NG Trading Monitor", layout="wide")
 st.title("🔥 Global NG Spreads, Storage & Weather Monitor")
 
-EIA_API_KEY = "KzzwPVmMSTVCI3pQbpL9calvF4CqGgEbwWy0qqXV"
+# IMPORTANT: Replace with your actual EIA key if the default doesn't work.
+EIA_API_KEY = "KzzwPVmMSTVCI3pQbpL9calvF4CqGgEbwWy0qqXV" 
 
 # EIA weekly working gas series IDs
 EIA_SERIES = {
@@ -34,6 +34,9 @@ EIA_SERIES = {
 }
 
 REGION_CAPACITY_BCF = {k: None for k in EIA_SERIES.keys()}
+
+# Path to your shapefile (ensure components are uploaded to the app directory)
+SHAPEFILE_PATH = "Natural_Gas_Interstate_and_Intrastate_Pipelines.shp"
 
 # Sidebar
 with st.sidebar:
@@ -54,7 +57,6 @@ def get_price_data():
     fx = yf.download("EURUSD=X", period="1d", interval="1d")['Close'].iloc[-1].item()
 
     # Convert TTF (EUR/MWh) to USD/MMBtu approximation
-    # 1 MWh = 3.412 MMBtu
     data['TTF_USD_MMBtu'] = (data['TTF_EUR'] * fx) / 3.412
 
     data['Spread_TTF_HH'] = data['TTF_USD_MMBtu'] - data['HenryHub_USD']
@@ -81,10 +83,6 @@ def get_eia_series(api_key: str, series_id: str, length_weeks: int = 52 * 15) ->
         r = requests.get(url, params=params, timeout=30)
         data = r.json()
 
-        if 'error' in data:
-            st.error(f"EIA API Error for {series_id}: {data['error']}")
-            return None
-
         if 'response' in data and 'data' in data['response'] and data['response']['data']:
             df = pd.DataFrame(data['response']['data'])
             df['period'] = pd.to_datetime(df['period'])
@@ -92,11 +90,9 @@ def get_eia_series(api_key: str, series_id: str, length_weeks: int = 52 * 15) ->
             df = df.sort_values('period').reset_index(drop=True)
             return df
         else:
-            st.error(f"EIA Structure Error: API returned empty data for series {series_id}.")
             return None
 
-    except Exception as e:
-        st.error(f"EIA Fetch Error for {series_id}: {e}")
+    except Exception:
         return None
 
 # --- 3. DATA SOURCE: WEATHER (HDD Forecast) ---
@@ -152,13 +148,18 @@ def compute_storage_analytics(df: pd.DataFrame) -> pd.DataFrame:
     df['year'] = df['period'].dt.year
     df['delta'] = df['value'].diff()
 
+    # Drop the first 5 years of data for a cleaner 5-year average calculation
+    start_year = df['year'].min() + 5
+    df = df[df['year'] >= start_year].copy()
+    
     grouped = df.groupby('week_of_year')
-
-    df['level_5y_avg'] = df['week_of_year'].map(grouped['value'].mean())
 
     delta_mean = grouped['delta'].mean()
     delta_std = grouped['delta'].std(ddof=0)
+    level_mean = grouped['value'].mean()
+    level_std = grouped['value'].std(ddof=0)
 
+    df['level_5y_avg'] = df['week_of_year'].map(level_mean)
     df['delta_5y_avg'] = df['week_of_year'].map(delta_mean)
     df['delta_dev_vs_5y'] = df['delta'] - df['delta_5y_avg']
 
@@ -178,8 +179,6 @@ def compute_storage_analytics(df: pd.DataFrame) -> pd.DataFrame:
         axis=1
     )
 
-    level_mean = grouped['value'].mean()
-    level_std = grouped['value'].std(ddof=0)
     df['level_zscore'] = df.apply(
         lambda r: _safe_z(r, level_mean, level_std, 'value'),
         axis=1
@@ -193,6 +192,131 @@ def compute_storage_analytics(df: pd.DataFrame) -> pd.DataFrame:
     df = df.merge(percentiles, on='week_of_year', how='left')
 
     return df
+
+# --- 4. MAP HELPERS (Pipeline Data) ---
+def gdf_to_plotly_lines(gdf: gpd.GeoDataFrame):
+    """
+    Convert a GeoDataFrame of LineString / MultiLineString geometries
+    into lon/lat lists suitable for a single Plotly Scattermapbox trace.
+    """
+    if gdf is None:
+        return [], []
+    if gdf.crs != "EPSG:4326":
+        try:
+            gdf = gdf.to_crs(epsg=4326)
+        except Exception:
+            pass # Use as is if projection fails
+
+    lons = []
+    lats = []
+
+    for geom in gdf.geometry:
+        if geom is None or getattr(geom, 'is_empty', False):
+            continue
+        if geom.geom_type in ["LineString", "MultiLineString"]:
+            lines = [geom] if geom.geom_type == "LineString" else geom.geoms
+            for line in lines:
+                try:
+                    x, y = line.xy
+                except Exception:
+                    continue
+                lons.extend(list(x))
+                lats.extend(list(y))
+                lons.append(None)
+                lats.append(None)
+
+    return lons, lats
+
+@st.cache_data
+def load_pipeline_data():
+    """
+    Load pipeline shapefile and boundary. Cached.
+    """
+    try:
+        pipelines_gdf = gpd.read_file(SHAPEFILE_PATH)
+
+        # Build bounding box from total extent
+        minx, miny, maxx, maxy = pipelines_gdf.total_bounds
+        bbox_polygon = box(minx, miny, maxx, maxy)
+
+        boundary_gdf = gpd.GeoDataFrame(
+            {"name": ["Pipeline Extent"]},
+            geometry=[bbox_polygon],
+            crs=pipelines_gdf.crs,
+        )
+
+        return pipelines_gdf, boundary_gdf
+
+    except Exception as e:
+        st.error(f"Error loading pipeline shapefile: {e}")
+        st.warning("Ensure .shp, .shx, .dbf, .prj (and .cpg) are present in the app directory.")
+        return None, None
+
+def create_satellite_map(gdf_pipelines: gpd.GeoDataFrame, gdf_boundary: gpd.GeoDataFrame):
+    """
+    Build a Plotly Scattermapbox figure with data overlays.
+    """
+    # 1) Mapbox token from Streamlit Cloud Secrets
+    mapbox_token = st.secrets.get("MAPBOX_TOKEN", None)
+    if not mapbox_token:
+        st.error("Mapbox token not found in Streamlit Secrets.")
+        st.info("Set MAPBOX_TOKEN in your Streamlit Cloud app secrets.")
+        return None
+
+    # 2) Prepare data and center
+    pipeline_lons, pipeline_lats = gdf_to_plotly_lines(gdf_pipelines)
+
+    try:
+        gdf_boundary_4326 = gdf_boundary.to_crs(epsg=4326)
+    except Exception:
+        gdf_boundary_4326 = gdf_boundary
+    center_point = gdf_boundary_4326.geometry.unary_union.centroid
+    center_lat = center_point.y
+    center_lon = center_point.x
+
+    fig = go.Figure()
+
+    # Pipelines trace (red)
+    fig.add_trace(
+        go.Scattermapbox(
+            mode="lines",
+            lon=pipeline_lons,
+            lat=pipeline_lats,
+            name="Pipelines",
+            line=dict(width=2, color="red"),
+            hoverinfo="none",
+        )
+    )
+
+    # Boundary layers (transparent fill + yellow outline)
+    boundary_geo = gdf_boundary_4326.__geo_interface__ if gdf_boundary_4326 is not None else None
+    layers = []
+    if boundary_geo is not None:
+        layers.extend([
+            # Fill layer (transparent)
+            {"source": boundary_geo, "type": "fill", "color": "rgba(0, 255, 0, 0.0)"},
+            # Outline layer (yellow)
+            {"source": boundary_geo, "type": "line", "color": "yellow", "line": {"width": 2}}
+        ])
+
+    # Map layout
+    fig.update_layout(
+        title="Natural Gas Pipelines on Satellite Imagery",
+        mapbox=dict(
+            # Using the standard satellite style that requires the 'styles:read' scope
+            style="satellite-streets", 
+            center=dict(lat=center_lat, lon=center_lon),
+            zoom=3, # Good initial zoom for US continental view
+            layers=layers,
+        ),
+        # Token passed at the layout level (Plotly standard practice)
+        mapbox_accesstoken=mapbox_token,  
+        margin={"r": 0, "t": 40, "l": 0, "b": 0},
+        height=700,
+    )
+
+    return fig
+
 
 # --- MAIN DASHBOARD LOGIC ---
 
@@ -335,182 +459,6 @@ st.markdown("---")
 # --- 4. U.S. Pipeline Map (Satellite) ---
 st.subheader("4. U.S. Pipeline Map (Satellite)")
 
-# Path to your shapefile (ensure components are uploaded to the app directory)
-SHAPEFILE_PATH = "Natural_Gas_Interstate_and_Intrastate_Pipelines.shp"
-
-def gdf_to_plotly_lines(gdf: gpd.GeoDataFrame):
-    """
-    Convert a GeoDataFrame of LineString / MultiLineString geometries
-    into lon/lat lists suitable for a single Plotly Scattermapbox trace.
-    Uses None separators between segments.
-    """
-    if gdf is None:
-        return [], []
-    if gdf.crs != "EPSG:4326":
-        try:
-            gdf = gdf.to_crs(epsg=4326)
-        except Exception:
-            # if to_crs fails, assume already in lon/lat
-            pass
-
-    lons = []
-    lats = []
-
-    for geom in gdf.geometry:
-        if geom is None or getattr(geom, 'is_empty', False):
-            continue
-        if geom.geom_type in ["LineString", "MultiLineString"]:
-            lines = [geom] if geom.geom_type == "LineString" else geom.geoms
-            for line in lines:
-                try:
-                    x, y = line.xy
-                except Exception:
-                    # skip invalid parts
-                    continue
-                lons.extend(list(x))
-                lats.extend(list(y))
-                lons.append(None)
-                lats.append(None)
-
-    return lons, lats
-
-@st.cache_data
-def load_pipeline_data():
-    """
-    Load pipeline shapefile and boundary. Cached.
-    Returns (pipelines_gdf, boundary_gdf) or (None, None) on failure.
-    """
-    try:
-        pipelines_gdf = gpd.read_file(SHAPEFILE_PATH)
-
-        # Build bounding box from total extent
-        minx, miny, maxx, maxy = pipelines_gdf.total_bounds
-        bbox_polygon = box(minx, miny, maxx, maxy)
-
-        boundary_gdf = gpd.GeoDataFrame(
-            {"name": ["Pipeline Extent"]},
-            geometry=[bbox_polygon],
-            crs=pipelines_gdf.crs,
-        )
-
-        return pipelines_gdf, boundary_gdf
-
-    except Exception as e:
-        st.error(f"Error loading pipeline shapefile: {e}")
-        st.warning("Ensure .shp, .shx, .dbf, .prj (and .cpg) are present in the app directory.")
-        return None, None
-
-def create_satellite_map(gdf_pipelines: gpd.GeoDataFrame, gdf_boundary: gpd.GeoDataFrame):
-    # Mapbox token from Streamlit Cloud Secrets
-    mapbox_token = st.secrets.get("MAPBOX_TOKEN", None)
-    if not mapbox_token:
-        st.error("Mapbox token not found in Streamlit Secrets.")
-        st.info("Set MAPBOX_TOKEN in your Streamlit Cloud app secrets.")
-        return None
-
-    pipeline_lons, pipeline_lats = gdf_to_plotly_lines(gdf_pipelines)
-
-    # Center
-    try:
-        gdf_boundary_4326 = gdf_boundary.to_crs(epsg=4326)
-    except Exception:
-        gdf_boundary_4326 = gdf_boundary
-    center_point = gdf_boundary_4326.geometry.unary_union.centroid
-    center_lat = center_point.y
-    center_lon = center_point.x
-
-    fig = go.Figure()
-
-    # Pipelines as a single trace
-    fig.add_trace(
-        go.Scattermapbox(
-            mode="lines",
-            lon=pipeline_lons,
-            lat=pipeline_lats,
-            name="Pipelines",
-            line=dict(width=2, color="red"),
-            hoverinfo="none",
-        )
-    )
-
-        # Build Mapbox layers ---------------------------
-    try:
-        boundary_json = gdf_boundary_4326.__geo_interface__
-    except Exception:
-        boundary_json = None
-
-    layers = []
-    if boundary_json:
-        # Transparent fill
-        layers.append(
-            {
-                "source": boundary_json,
-                "type": "fill",
-                "color": "rgba(0, 255, 0, 0)"  # invisible fill
-            }
-        )
-        # Yellow outline
-        layers.append(
-            {
-                "source": boundary_json,
-                "type": "line",
-                "color": "yellow",
-                "line": {"width": 2}
-            }
-        )
-
-    # Map layout (THIS IS THE FIX)
-    fig.update_layout(
-        mapbox=dict(
-            style="satellite-streets-v12",   # ← REQUIRED on Streamlit Cloud
-            accesstoken=mapbox_token,        # ← MUST be inside mapbox={}
-            center=dict(lat=center_lat, lon=center_lon),
-            zoom=4,
-            layers=layers,
-        ),
-        margin=dict(l=0, r=0, t=0, b=0),
-        height=700,
-        showlegend=False,
-    )
-
-    return fig
-
-    # Boundary: separate fill + outline (Mapbox GL compliant)
-    try:
-        boundary_geo = gdf_boundary_4326.__geo_interface__
-    except Exception:
-        boundary_geo = None
-
-    layers = []
-    if boundary_geo is not None:
-        boundary_fill = {
-            "source": boundary_geo,
-            "type": "fill",
-            "color": "rgba(0, 255, 0, 0)"  # transparent fill
-        }
-        boundary_outline = {
-            "source": boundary_geo,
-            "type": "line",
-            "color": "yellow",
-            "line": {"width": 2}
-        }
-        layers = [boundary_fill, boundary_outline]
-
-    fig.update_layout(
-        title="Natural Gas Pipelines on Satellite Imagery",
-        mapbox=dict(
-            style="satellite-streets",
-            center=dict(lat=center_lat, lon=center_lon),
-            zoom=3,
-            layers=layers,
-        ),
-        mapbox_accesstoken=mapbox_token,
-        margin={"r": 0, "t": 40, "l": 0, "b": 0},
-        height=700,
-    )
-
-    return fig
-
 # Load and render the pipeline map
 pipelines_gdf, boundary_gdf = load_pipeline_data()
 if pipelines_gdf is not None and boundary_gdf is not None:
@@ -521,4 +469,3 @@ else:
     st.info("Pipeline map not available. Upload the shapefile components to the app directory and reload.")
 
 # End of app
-
