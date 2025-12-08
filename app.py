@@ -9,6 +9,11 @@ from retry_requests import retry
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import numpy as np
+# --- NEW GIS IMPORTS ---
+import geopandas as gpd
+import matplotlib.pyplot as plt
+from shapely.geometry import Point, Polygon
+# -----------------------
 
 # --- CONFIGURATION ---
 st.set_page_config(page_title="NG Trading Monitor", layout="wide")
@@ -50,13 +55,15 @@ with st.sidebar:
         st.rerun()
 
 # --- 1. DATA SOURCE: PRICES (International Spreads) ---
-@st.cache_data(ttl=3600*24)  # Cache for 24 hours
+@st.cache_data(ttl=3600*24) # Cache for 24 hours
 def get_price_data():
     """
     Fetches Henry Hub (US), and proxies for TTF (EU).
     """
     tickers = ['NG=F', 'TTF=F']
-    data = yf.download(tickers, period="1y", interval="1d")['Close']
+    # Use a specific start date to ensure Henry Hub has historical data for a good Z-score baseline
+    start_date = (datetime.date.today() - datetime.timedelta(days=365 * 10)).strftime('%Y-%m-%d')
+    data = yf.download(tickers, start=start_date, interval="1d")['Close']
 
     # Clean up column names
     data.rename(columns={'NG=F': 'HenryHub_USD', 'TTF=F': 'TTF_EUR'}, inplace=True)
@@ -70,6 +77,9 @@ def get_price_data():
 
     # Calculate Spread (Arb Window)
     data['Spread_TTF_HH'] = data['TTF_USD_MMBtu'] - data['HenryHub_USD']
+
+    # Calculate Z-score for Henry Hub price (vs 10-year history)
+    data['HenryHub_Z'] = (data['HenryHub_USD'] - data['HenryHub_USD'].mean()) / data['HenryHub_USD'].std(ddof=0)
 
     return data.sort_index(ascending=False)
 
@@ -109,7 +119,7 @@ def get_eia_series(api_key: str, series_id: str, length_weeks: int = 52 * 15) ->
             df = df.sort_values('period').reset_index(drop=True)
             return df
         else:
-            st.error(f"EIA Structure Error: API returned empty data for series {series_id}.")
+            # st.error(f"EIA Structure Error: API returned empty data for series {series_id}.")
             return None
 
     except Exception as e:
@@ -117,7 +127,7 @@ def get_eia_series(api_key: str, series_id: str, length_weeks: int = 52 * 15) ->
         return None
 
 # --- 3. DATA SOURCE: WEATHER (HDD Forecast) ---
-@st.cache_data(ttl=3600*12)  # Update weather every 12 hours
+@st.cache_data(ttl=3600*12) # Update weather every 12 hours
 def get_weather_demand():
     """
     Uses Open-Meteo to fetch 10-day forecast for key gas-consuming hubs:
@@ -228,6 +238,153 @@ def compute_storage_analytics(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
+# --- HELPER: GET SCT Z-SCORE FOR MAP ---
+def get_sct_zscore_for_map(api_key):
+    """Fetches and computes the latest storage level Z-score for South Central Total."""
+    sct_series = EIA_SERIES["South Central Total"]
+    sct_df = get_eia_series(api_key, sct_series)
+    if sct_df is not None and not sct_df.empty:
+        sct_df_analyzed = compute_storage_analytics(sct_df)
+        return sct_df_analyzed.iloc[-1]['level_zscore']
+    return None
+
+# --- GEOSPATIAL POC FUNCTION ---
+def plot_gis_poc(henry_hub_z: float, sct_z: float):
+    """
+    Generates the proof-of-concept map using the uploaded shapefile
+    and calculated anomalies.
+    """
+    st.markdown("---")
+    st.subheader("4. Geospatial Trading View (PoC)")
+    st.write("Visualizing key market anomalies on the physical infrastructure map (Gulf Coast focus).")
+    
+    try:
+        # Load User's Pipeline Shapefile (requires all components: shp, shx, dbf, prj)
+        pipeline_gdf = gpd.read_file("Natural_Gas_Interstate_and_Intrastate_Pipelines.shp")
+        # Assuming the PRJ file handles the CRS correctly, converting to WGS84 for safety
+        pipeline_gdf = pipeline_gdf.to_crs(epsg=4326) 
+    
+        # Bounding box for Gulf Coast (approx. -100 to -80 longitude, 25 to 35 latitude)
+        bbox = [-100, 25, -80, 35]
+        pipeline_gdf_filtered = pipeline_gdf.cx[bbox[0]:bbox[2], bbox[1]:bbox[3]]
+    
+        # --- Define Key Trading Points & Anomalies ---
+    
+        # A. Henry Hub (H_HUB) - Price Benchmark
+        henry_hub_data = {
+            'name': ['Henry Hub'],
+            'longitude': [-92.0000],
+            'latitude': [30.0716],
+        }
+        henry_hub_gdf = gpd.GeoDataFrame(
+            henry_hub_data,
+            geometry=gpd.points_from_xy(henry_hub_data['longitude'], henry_hub_data['latitude']),
+            crs="EPSG:4326"
+        )
+        # Determine Henry Hub marker color based on Z-score
+        # Green = High Price (Bullish), Red = Low Price (Bearish)
+        hh_color = 'green' if henry_hub_z > 0.5 else ('red' if henry_hub_z < -0.5 else 'yellow')
+        hh_size = 1000 + abs(henry_hub_z) * 500
+        hh_label = f"HH Price Z-Score: {henry_hub_z:.2f}"
+    
+        # B. Key LNG Terminals (Simulated Demand Shock Points)
+        # This remains simulated as we don't have LNG flow data
+        lng_data = {
+            'name': ['Sabine Pass LNG', 'Corpus Christi LNG'],
+            'longitude': [-93.8841, -97.3941],
+            'latitude': [29.7431, 27.8732],
+            'simulated_flow_shock': [0.10, 0.40] # Simulated: Sabine 10% outage, Corpus 40% outage
+        }
+        lng_gdf = gpd.GeoDataFrame(
+            lng_data,
+            geometry=gpd.points_from_xy(lng_data['longitude'], lng_data['latitude']),
+            crs="EPSG:4326"
+        )
+    
+        # C. South Central (SCT) Storage Region (Conceptual Polygon for visual focus)
+        # We use a conceptual polygon for visualization, as the actual complex shapefile is not available
+        sct_polygon_coords = [
+            (-100, 25), (-100, 35), (-80, 35), (-80, 25), (-100, 25)
+        ]
+        sct_region_poly = Polygon(sct_polygon_coords)
+        sct_region_gdf = gpd.GeoDataFrame(
+            {'name': ['South Central (SCT)'], 'storage_zscore': [sct_z]},
+            geometry=[sct_region_poly],
+            crs="EPSG:4326"
+        )
+        # Determine SCT region color/opacity based on Z-score
+        # Red = Low Storage (Bullish), Green = High Storage (Bearish)
+        sct_fill_color = 'red' if sct_z < -0.5 else ('green' if sct_z > 0.5 else 'yellow')
+        sct_alpha = min(0.6, 0.2 + abs(sct_z) * 0.4)
+        sct_label = f"SCT Level Z-Score: {sct_z:.2f}"
+    
+        # --- Create the Visualization ---
+        fig, ax = plt.subplots(1, 1, figsize=(12, 12))
+    
+        # Plot 1: SCT Storage Region (Dynamic Color/Opacity)
+        sct_region_gdf.plot(
+            ax=ax, 
+            color=sct_fill_color, 
+            alpha=sct_alpha, 
+            edgecolor='black', 
+            linewidth=1, 
+            label='SCT Storage Region'
+        )
+    
+        # Plot 2: Pipelines (Gray)
+        pipeline_gdf_filtered.plot(ax=ax, color='gray', linewidth=0.5, alpha=0.5)
+    
+        # Plot 3: LNG Terminals (Blue Circles, scaled by simulated shock)
+        lng_gdf.plot(
+            ax=ax,
+            marker='o',
+            color='blue',
+            markersize=lng_gdf['simulated_flow_shock'] * 4000,
+            alpha=0.6,
+            edgecolor='black',
+            label='LNG Terminal Demand Shock'
+        )
+        # Add text labels for LNG
+        for x, y, label, shock in zip(lng_gdf.geometry.x, lng_gdf.geometry.y, lng_gdf['name'], lng_gdf['simulated_flow_shock']):
+            if shock > 0.0:
+                ax.annotate(f"{label} ({shock*100:.0f}% shock)", xy=(x, y), xytext=(5, 5), textcoords="offset points", fontsize=8, color='darkblue')
+    
+        # Plot 4: Henry Hub (Dynamic Star)
+        henry_hub_gdf.plot(
+            ax=ax,
+            marker='*',
+            color=hh_color,
+            markersize=hh_size,
+            edgecolor='black',
+            label='Henry Hub Price Benchmark'
+        )
+        # Add text label for Henry Hub
+        x, y, label = henry_hub_gdf.geometry.x[0], henry_hub_gdf.geometry.y[0], henry_hub_gdf['name'][0]
+        ax.annotate(label, xy=(x, y), xytext=(5, -15), textcoords="offset points", fontsize=10, color=hh_color, fontweight='bold')
+    
+        # Add legend/title
+        ax.set_title("PoC: Natural Gas Trading Infrastructure & Anomaly Map (Gulf Coast Focus)", fontsize=14)
+        ax.set_xlabel("Longitude")
+        ax.set_ylabel("Latitude")
+        ax.set_aspect('equal')
+        ax.grid(True, alpha=0.1)
+        
+        # Display the anomaly data on the map
+        ax.text(bbox[0]+1, bbox[3]-1.5, 
+                f"Market Anomaly Summary:\n\n"
+                f"SCT Storage Status: {sct_label}\n"
+                f"Henry Hub Price Status: {hh_label}",
+                fontsize=10, 
+                color='black', 
+                bbox=dict(facecolor='white', alpha=0.7, edgecolor='none'))
+    
+        st.pyplot(fig)
+        
+    except Exception as e:
+        st.error(f"⚠️ Could not generate the GIS map. Ensure all shapefile components are uploaded correctly: {e}")
+        st.info("The map requires: Natural_Gas_Interstate_and_Intrastate_Pipelines.shp, .shx, .dbf, .prj.")
+
+
 # --- MAIN DASHBOARD LOGIC ---
 
 # 1. Prices & Spreads
@@ -235,6 +392,9 @@ st.subheader("1. International Future Spreads (Arbitrage Window)")
 try:
     price_df = get_price_data()
     latest = price_df.iloc[0]
+
+    # Get the Henry Hub Z-score for use in the map
+    henry_hub_z_score = latest['HenryHub_Z'] if pd.notna(latest['HenryHub_Z']) else 0.0
 
     col1, col2, col3 = st.columns(3)
     col1.metric("Henry Hub (US)", f"${latest['HenryHub_USD']:.2f}", f"{price_df['HenryHub_USD'].diff().iloc[0]:.2f}")
@@ -249,6 +409,7 @@ try:
 
 except Exception as e:
     st.warning(f"Could not load price data (Yahoo Finance might be throttling): {e}")
+    henry_hub_z_score = 0.0 # Default to 0 if data fails
 
 st.markdown("---")
 
@@ -303,7 +464,7 @@ if storage_df is not None and not storage_df.empty:
     # ---- LIMIT DISPLAY TO LAST 2 YEARS (104 WEEKS) ----
     display_window_weeks = 52 * 2
     display_df = storage_df.tail(display_window_weeks)
-    recent = display_df  # for deltas / z-scores
+    recent = display_df # for deltas / z-scores
 
     # --- 2A. Storage Level + Fan Chart (last 2 years only) ---
     fig_store = go.Figure()
@@ -436,7 +597,7 @@ if storage_df is not None and not storage_df.empty:
     # This is already limited to last ~5 gas years; keep as-is
     fig_cum = go.Figure()
     for gy, sub in storage_df.groupby('gas_year'):
-        if gy >= storage_df['gas_year'].max() - 4:  # last ~5 gas years
+        if gy >= storage_df['gas_year'].max() - 4: # last ~5 gas years
             fig_cum.add_trace(go.Scatter(
                 x=sub['period'],
                 y=sub['cum_dev_vs_5y'],
@@ -456,7 +617,10 @@ if storage_df is not None and not storage_df.empty:
 
 else:
     st.warning(f"⚠️ Could not load storage data for {selected_region}.")
+    # Default Z-score if data fails
+    sct_storage_z_score = 0.0
 
+st.markdown("---")
 
 # 3. Weather
 st.subheader("3. 10-Day HDD Forecast (Gas Demand Proxy)")
@@ -471,3 +635,13 @@ try:
 
 except Exception as e:
     st.error(f"Weather data error: {e}")
+    
+# --- 4. GIS MAP POC CALL ---
+
+# Get the South Central Z-score to drive the map's visual anomaly
+sct_storage_z_score = get_sct_zscore_for_map(EIA_API_KEY) or 0.0
+
+if 'henry_hub_z_score' in locals():
+    plot_gis_poc(henry_hub_z_score, sct_storage_z_score)
+else:
+    st.warning("Cannot generate GIS map. Price data (Henry Hub Z-Score) is not available.")
