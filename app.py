@@ -1,6 +1,7 @@
 import streamlit as st
 import geopandas as gpd
 import plotly.graph_objects as go
+# import os # <-- Removed: no longer needed when using st.secrets
 from shapely.geometry import box
 
 # ---------------------------------------------------------
@@ -91,15 +92,12 @@ def create_satellite_map(gdf_pipelines: gpd.GeoDataFrame,
     - Red pipeline lines
     - Transparent boundary polygon with yellow outline
     """
-    # 1) Get Mapbox token from Streamlit secrets
+    # 1) Get Mapbox token from Streamlit secrets (BEST PRACTICE)
     mapbox_token = st.secrets.get("MAPBOX_TOKEN", None)
 
     if not mapbox_token:
-        st.error("Mapbox token not found.")
-        st.info(
-            "Add MAPBOX_TOKEN to `.streamlit/secrets.toml`, e.g.\n\n"
-            'MAPBOX_TOKEN = "pk.eyJ1IjoieW91cl9pZCIsImEiOiJja..."'
-        )
+        st.error("Mapbox token not found in Streamlit Secrets.")
+        st.info("Please confirm the secret **MAPBOX_TOKEN** is set in your Streamlit Cloud app settings.")
         return None
 
     # 2) Prepare pipeline line coordinates
@@ -143,7 +141,7 @@ def create_satellite_map(gdf_pipelines: gpd.GeoDataFrame,
             zoom=3,
             layers=[boundary_layer],
         ),
-        mapbox_accesstoken=mapbox_token,  # IMPORTANT: token here
+        mapbox_accesstoken=mapbox_token,  # Token passed directly to Plotly layout
         margin={"r": 0, "t": 40, "l": 0, "b": 0},
         height=700,
     )
