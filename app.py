@@ -51,13 +51,6 @@ def get_storage_centroids(storage_df_latest):
         "South Central Salt": {"Lat": 30.0, "Lon": -92.0}, # LA/TX Gulf Coast
         "South Central Non-Salt": {"Lat": 34.0, "Lon": -99.0}, # TX/OK Panhandle
     }
-    
-    data = []
-    # We iterate through the specific regions we know we have keys for in EIA_SERIES
-    # Note: We need the *latest* value for each region.
-    # This requires fetching data for ALL regions, not just the selected one.
-    # For performance, we will only map the regions if we have the data.
-    
     return centroids
 
 
@@ -87,6 +80,7 @@ with st.sidebar:
     if st.button("Force Refresh Data"):
         st.cache_data.clear()
         st.rerun()
+    show_noaa = st.checkbox("Show NOAA 8–14d Temp Outlook on Map", value=True)
 
 # --- 1. DATA SOURCE: PRICES (International Spreads) ---
 @st.cache_data(ttl=3600*24)  # Cache for 24 hours
@@ -181,6 +175,119 @@ def get_weather_demand():
     final_df = pd.concat(results)
     final_df.rename(columns={'date': 'date'}, inplace=True)
     return final_df
+
+# --- 3B. DATA SOURCE: NOAA CPC 8–14 Day Temp Probability Outlook ---
+
+@st.cache_data(ttl=3600*6)  # refresh every 6 hours
+def get_noaa_cpc_8_14_temp_prob():
+    """
+    Fetch NOAA CPC 8–14 day temperature probability outlook (CONUS grid).
+
+    Returns
+    -------
+    gdf : GeoDataFrame with columns:
+        ['lon', 'lat', 'prob_above', 'prob_below']
+    """
+    import json
+
+    # CPC 8–14 day temperature outlook (CONUS) – GeoJSON endpoint
+    url = (
+        "https://www.cpc.ncep.noaa.gov/products/predictions/814day/"
+        "prob/814temp.newprob.geojson"
+    )
+
+    try:
+        r = requests.get(url, timeout=30)
+        r.raise_for_status()
+        js = r.json()
+
+        features = js.get("features", [])
+        if not features:
+            return None
+
+        lats, lons, p_above, p_below = [], [], [], []
+        for f in features:
+            geom = f.get("geometry", {})
+            props = f.get("properties", {})
+            if geom.get("type") != "Point":
+                continue
+            coords = geom.get("coordinates", None)
+            if not coords or len(coords) < 2:
+                continue
+
+            lon, lat = coords[0], coords[1]
+            pa = props.get("PROB_ABOVE", None)
+            pb = props.get("PROB_BELOW", None)
+
+            if pa is None and pb is None:
+                continue
+
+            lons.append(lon)
+            lats.append(lat)
+            p_above.append(pa if pa is not None else 0)
+            p_below.append(pb if pb is not None else 0)
+
+        if not lons:
+            return None
+
+        gdf = gpd.GeoDataFrame(
+            {
+                "lon": lons,
+                "lat": lats,
+                "prob_above": p_above,
+                "prob_below": p_below,
+            },
+            geometry=gpd.points_from_xy(lons, lats),
+            crs="EPSG:4326",
+        )
+        return gdf
+
+    except Exception as e:
+        st.warning(f"NOAA CPC 8–14 day outlook fetch failed: {e}")
+        return None
+
+
+def aggregate_noaa_to_storage_regions(noaa_gdf: gpd.GeoDataFrame, centroids: dict):
+    """
+    Map NOAA grid probabilities to EIA storage regions using nearest-neighbour
+    to each region centroid.
+
+    Returns
+    -------
+    DataFrame with:
+        region, lat, lon, prob_above, prob_below, temp_bias
+    """
+    if noaa_gdf is None or noaa_gdf.empty:
+        return pd.DataFrame()
+
+    from scipy.spatial import cKDTree
+    pts = np.vstack([noaa_gdf["lon"].values, noaa_gdf["lat"].values]).T
+    tree = cKDTree(pts)
+
+    rows = []
+    for region, c in centroids.items():
+        lon_c, lat_c = c["Lon"], c["Lat"]
+        dist, idx = tree.query([lon_c, lat_c], k=10)
+        if np.isscalar(idx):
+            idx = [idx]
+
+        sub = noaa_gdf.iloc[idx]
+        pa = sub["prob_above"].mean()
+        pb = sub["prob_below"].mean()
+        temp_bias = pa - pb
+
+        rows.append(
+            {
+                "region": region,
+                "lat": lat_c,
+                "lon": lon_c,
+                "prob_above": pa,
+                "prob_below": pb,
+                "temp_bias": temp_bias,
+            }
+        )
+
+    return pd.DataFrame(rows)
 
 # --- HELPER: STORAGE ANALYTICS TRANSFORMS ---
 def compute_storage_analytics(df: pd.DataFrame) -> pd.DataFrame:
@@ -294,121 +401,6 @@ def load_pipeline_data():
         st.error(f"Error loading pipeline shapefile: {e}")
         st.warning("Ensure .shp, .shx, .dbf, .prj (and .cpg) are present in the app directory.")
         return None, None
-
-def create_satellite_map(gdf_pipelines, gdf_boundary, lng_df, storage_points_df):
-    """
-    Enhanced Map: Pipelines + LNG Terminals + Storage Bubbles
-    """
-    import os
-    
-    # --- 1. Mapbox Token Logic ---
-    mapbox_token = None
-    if "MAPBOX_TOKEN" in st.secrets:
-        mapbox_token = st.secrets["MAPBOX_TOKEN"]
-    if not mapbox_token:
-        mapbox_token = os.getenv("MAPBOX_TOKEN")
-
-    # Fallback to Carto if no token or invalid token
-    use_satellite = False
-    map_style = "carto-darkmatter"
-    
-    if mapbox_token and mapbox_token.startswith("pk."):
-        use_satellite = True
-        map_style = "satellite-streets"
-    
-    # --- 2. Base Geometry (Pipelines) ---
-    pipeline_lons, pipeline_lats = gdf_to_plotly_lines(gdf_pipelines)
-    
-    try:
-        gdf_boundary_4326 = gdf_boundary.to_crs(epsg=4326)
-        center_point = gdf_boundary_4326.geometry.unary_union.centroid
-        center_lat = center_point.y
-        center_lon = center_point.x
-    except:
-        center_lat, center_lon = 39.8, -98.6 # Default US Center
-
-    fig = go.Figure()
-
-    # Layer 1: Pipelines (Thinner line for background context)
-    fig.add_trace(
-        go.Scattermapbox(
-            mode="lines",
-            lon=pipeline_lons,
-            lat=pipeline_lats,
-            name="Pipelines",
-            line=dict(width=1, color="rgba(255, 75, 75, 0.6)"), # Streamlit Red, semi-transparent
-            hoverinfo="none",
-        )
-    )
-
-    # Layer 2: LNG Terminals (Green Squares)
-    if not lng_df.empty:
-        fig.add_trace(
-            go.Scattermapbox(
-                mode="markers",
-                lon=lng_df['Lon'],
-                lat=lng_df['Lat'],
-                name="LNG Export Terminals",
-                text=lng_df['Name'] + "<br>Cap: " + lng_df['Capacity_Bcfd'].astype(str) + " Bcfd",
-                marker=dict(
-                    size=12,
-                    color='#00ff00', # Neon Green
-                    symbol='square',
-                    opacity=0.9
-                ),
-                hoverinfo='text'
-            )
-        )
-
-    # Layer 3: Regional Storage Levels (Blue Bubbles)
-    if storage_points_df is not None and not storage_points_df.empty:
-        # Scale bubble size. Max storage ~1000 Bcf (SC Total) -> Size 40
-        # Min storage ~200 Bcf -> Size 10
-        fig.add_trace(
-            go.Scattermapbox(
-                mode="markers+text",
-                lon=storage_points_df['lon'],
-                lat=storage_points_df['lat'],
-                name="Regional Storage (Bcf)",
-                text=storage_points_df['value'].astype(int).astype(str) + " Bcf",
-                textposition="bottom center",
-                hovertext=storage_points_df['region'] + "<br>Current: " + storage_points_df['value'].astype(str) + " Bcf",
-                marker=dict(
-                    # Logarithmic scaling or simple linear scaling for size
-                    size=storage_points_df['value'] / 25, 
-                    sizemin=8,
-                    color='#3399ff', # Light Blue
-                    opacity=0.6,
-                ),
-                hoverinfo='text'
-            )
-        )
-
-    # --- 3. Layout ---
-    layout_args = dict(
-        title="Infrastructure Map: Pipelines, LNG Terminals & Storage Hubs",
-        mapbox=dict(
-            style=map_style,
-            center=dict(lat=center_lat, lon=center_lon),
-            zoom=3.5,
-        ),
-        margin={"r": 0, "t": 40, "l": 0, "b": 0},
-        height=750,
-        legend=dict(
-            yanchor="top",
-            y=0.99,
-            xanchor="left",
-            x=0.01,
-            bgcolor="rgba(0,0,0,0.5)"
-        )
-    )
-    
-    if use_satellite:
-        layout_args["mapbox_accesstoken"] = mapbox_token
-
-    fig.update_layout(**layout_args)
-    return fig
-
 
 # --- MAIN DASHBOARD LOGIC ---
 
@@ -548,11 +540,10 @@ except Exception as e:
 
 st.markdown("---")
 
-# --- 4. U.S. Infrastructure Map (Pipelines, LNG, Storage) ---
-st.subheader("4. U.S. Infrastructure Map (Pipelines, LNG, Storage)")
+# --- 4. U.S. Infrastructure Map (Pipelines, LNG, Storage, NOAA) ---
+st.subheader("4. U.S. Infrastructure Map (Pipelines, LNG, Storage, NOAA Outlook)")
 
 # 1. Update Capacities (Approximate Design Capacity in Bcf for % Calc)
-# These are estimates based on recent EIA data to enable the % calculation.
 REGION_CAPACITY_BCF = {
     "East": 950,
     "Midwest": 1100,
@@ -560,7 +551,6 @@ REGION_CAPACITY_BCF = {
     "Pacific": 420,
     "South Central Salt": 490,
     "South Central Non-Salt": 980,
-    # Note: South Central Total is the sum of Salt + Non-Salt
     "South Central Total": 1470 
 }
 
@@ -568,22 +558,23 @@ REGION_CAPACITY_BCF = {
 lng_df = get_lng_terminals()
 
 storage_map_data = []
-# We map the specific sub-regions that have distinct geographies
 regions_to_map = ["East", "Midwest", "Mountain", "Pacific", "South Central Salt", "South Central Non-Salt"]
 centroids = get_storage_centroids(None)
+
+# NOAA regional aggregation
+noaa_gdf = get_noaa_cpc_8_14_temp_prob()
+noaa_regional_df = aggregate_noaa_to_storage_regions(noaa_gdf, centroids)
 
 with st.spinner("Loading infrastructure layers..."):
     # Fetch latest storage data for the map
     for reg in regions_to_map:
         if reg in EIA_SERIES:
             sid = EIA_SERIES[reg]
-            # Get small slice of data just for the latest value
             df_reg = get_eia_series(EIA_API_KEY, sid, length_weeks=5)
             
             if df_reg is not None and not df_reg.empty:
                 latest_val = df_reg.iloc[-1]['value']
                 
-                # Calculate % Full
                 cap = REGION_CAPACITY_BCF.get(reg)
                 pct_str = "N/A"
                 if cap:
@@ -602,11 +593,23 @@ with st.spinner("Loading infrastructure layers..."):
 
 storage_points_df = pd.DataFrame(storage_map_data)
 
+# Merge NOAA bias into storage_points_df
+if not noaa_regional_df.empty and not storage_points_df.empty:
+    storage_points_df = storage_points_df.merge(
+        noaa_regional_df[["region", "prob_above", "prob_below", "temp_bias"]],
+        on="region",
+        how="left",
+    )
+else:
+    storage_points_df["prob_above"] = np.nan
+    storage_points_df["prob_below"] = np.nan
+    storage_points_df["temp_bias"] = np.nan
+
 # 3. Load Shapefiles
 pipelines_gdf, boundary_gdf = load_pipeline_data()
 
-# 4. Define the plotting function locally to ensure it uses the new styles
-def create_satellite_map_v2(gdf_pipelines, gdf_boundary, lng_df, storage_points_df):
+# 4. Map plotting function (v2 with NOAA layer)
+def create_satellite_map_v2(gdf_pipelines, gdf_boundary, lng_df, storage_points_df, show_noaa=True):
     import os
     mapbox_token = None
     if "MAPBOX_TOKEN" in st.secrets:
@@ -614,17 +617,14 @@ def create_satellite_map_v2(gdf_pipelines, gdf_boundary, lng_df, storage_points_
     if not mapbox_token:
         mapbox_token = os.getenv("MAPBOX_TOKEN")
 
-    # Fallback style if token is missing
     use_satellite = False
     map_style = "carto-darkmatter"
     if mapbox_token and mapbox_token.startswith("pk."):
         use_satellite = True
         map_style = "satellite-streets"
 
-    # Pipeline Geometries
     pipeline_lons, pipeline_lats = gdf_to_plotly_lines(gdf_pipelines)
     
-    # Center map
     try:
         gdf_boundary_4326 = gdf_boundary.to_crs(epsg=4326)
         center_point = gdf_boundary_4326.geometry.unary_union.centroid
@@ -634,7 +634,7 @@ def create_satellite_map_v2(gdf_pipelines, gdf_boundary, lng_df, storage_points_
 
     fig = go.Figure()
 
-    # LAYER 1: Pipelines (Thinner, Red, Semi-Transparent)
+    # LAYER 1: Pipelines
     fig.add_trace(go.Scattermapbox(
         mode="lines",
         lon=pipeline_lons,
@@ -645,7 +645,6 @@ def create_satellite_map_v2(gdf_pipelines, gdf_boundary, lng_df, storage_points_
     ))
 
     # LAYER 2: LNG Terminals
-    # FIX: Use 'circle' (reliable) but styled as Bright Green Buttons with Black Border
     if not lng_df.empty:
         fig.add_trace(go.Scattermapbox(
             mode="markers",
@@ -655,44 +654,70 @@ def create_satellite_map_v2(gdf_pipelines, gdf_boundary, lng_df, storage_points_
             text=lng_df['Name'] + "<br>Cap: " + lng_df['Capacity_Bcfd'].astype(str) + " Bcfd",
             marker=dict(
                 size=12,
-                color='#39FF14', # Neon Green
+                color='#39FF14',
                 opacity=1.0,
-                # Simulate a square/icon by adding a heavy border
-                # Note: Scattermapbox markers are always circles in basic mode, 
-                # but a thick black outline makes them pop like icons.
             ),
             hoverinfo='text'
         ))
 
     # LAYER 3: Storage Bubbles
-    # UPDATES: Darker Blue, Larger, Text includes % Full
     if storage_points_df is not None and not storage_points_df.empty:
         fig.add_trace(go.Scattermapbox(
             mode="markers+text",
             lon=storage_points_df['lon'],
             lat=storage_points_df['lat'],
             name="Regional Storage",
-            # Text label directly on map
-            text=storage_points_df['pct_full'], 
+            text=storage_points_df['pct_full'],
             textposition="middle center",
             textfont=dict(size=11, color="white", weight="bold"),
-            # Hover details
             hovertext=storage_points_df['region'] + 
                       "<br>Vol: " + storage_points_df['value'].astype(int).astype(str) + " Bcf" +
                       "<br>Full: " + storage_points_df['pct_full'],
             marker=dict(
-                # Increased sizing scaling (value / 12 instead of 25)
                 size=storage_points_df['value'] / 12, 
-                sizemin=15, # Minimum size ensures readability of text
-                color='#003366', # Dark Navy Blue
+                sizemin=15,
+                color='#003366',
                 opacity=0.8,
             ),
             hoverinfo='text'
         ))
 
-    # Layout
+    # LAYER 4: NOAA 8–14d Temperature Bias
+    if show_noaa and storage_points_df is not None and not storage_points_df.empty and "temp_bias" in storage_points_df.columns:
+        df_noaa = storage_points_df.dropna(subset=["temp_bias"]).copy()
+        if not df_noaa.empty:
+            df_noaa["temp_bias_clipped"] = df_noaa["temp_bias"].clip(-50, 50)
+
+            fig.add_trace(
+                go.Scattermapbox(
+                    mode="markers",
+                    lon=df_noaa["lon"],
+                    lat=df_noaa["lat"],
+                    name="NOAA 8–14d Temp Bias",
+                    hovertext=(
+                        df_noaa["region"]
+                        + "<br>Prob Above: " + df_noaa["prob_above"].round(0).astype(int).astype(str) + "%"
+                        + "<br>Prob Below: " + df_noaa["prob_below"].round(0).astype(int).astype(str) + "%"
+                        + "<br>Bias (Above - Below): " + df_noaa["temp_bias"].round(1).astype(str) + " pts"
+                    ),
+                    marker=dict(
+                        size=22,
+                        color=df_noaa["temp_bias_clipped"],
+                        colorscale=[
+                            [0.0, "rgb(0, 70, 200)"],
+                            [0.5, "rgb(255, 255, 255)"],
+                            [1.0, "rgb(200, 0, 0)"],
+                        ],
+                        cmin=-50,
+                        cmax=50,
+                        opacity=0.7,
+                    ),
+                    hoverinfo="text",
+                )
+            )
+
     layout_args = dict(
-        title="US Natural Gas Infrastructure & Storage Utilization",
+        title="US Natural Gas Infrastructure, Storage & NOAA 8–14d Outlook",
         mapbox=dict(
             style=map_style,
             center=dict(lat=center_lat, lon=center_lon),
@@ -709,18 +734,90 @@ def create_satellite_map_v2(gdf_pipelines, gdf_boundary, lng_df, storage_points_
     fig.update_layout(**layout_args)
     return fig
 
-# 5. Render
+# 5. Render map
 if pipelines_gdf is not None:
-    fig_map = create_satellite_map_v2(pipelines_gdf, boundary_gdf, lng_df, storage_points_df)
+    fig_map = create_satellite_map_v2(pipelines_gdf, boundary_gdf, lng_df, storage_points_df, show_noaa=show_noaa)
     st.plotly_chart(fig_map, use_container_width=True)
 else:
     st.info("Pipeline map components missing.")
 
-# End of app
+# 6. Regional Trade Screen: Storage vs NOAA Outlook
+st.markdown("### 5. Regional Trade Screen: Storage vs NOAA 8–14d Outlook")
 
+if not storage_points_df.empty:
+    # For each mapped region, also compute latest storage z-score from full history
+    trade_rows = []
+    for reg in regions_to_map:
+        sid = EIA_SERIES.get(reg)
+        if not sid:
+            continue
+        df_reg_full = get_eia_series(EIA_API_KEY, sid, length_weeks=52*15)
+        if df_reg_full is None or df_reg_full.empty:
+            continue
+        df_reg_full = compute_storage_analytics(df_reg_full)
+        latest_row = df_reg_full.iloc[-1]
 
+        level_z = latest_row.get("level_zscore", np.nan)
+        level = latest_row.get("value", np.nan)
 
+        row_map = storage_points_df[storage_points_df["region"] == reg]
+        if row_map.empty:
+            continue
+        row_map = row_map.iloc[0]
 
+        trade_rows.append(
+            {
+                "Region": reg,
+                "Storage_Bcf": level,
+                "Storage_Z": level_z,
+                "Pct_Full": row_map["pct_full"],
+                "NOAA_Prob_Above": row_map.get("prob_above", np.nan),
+                "NOAA_Prob_Below": row_map.get("prob_below", np.nan),
+                "Temp_Bias": row_map.get("temp_bias", np.nan),
+            }
+        )
 
+    if trade_rows:
+        trade_df = pd.DataFrame(trade_rows)
 
+        # Rank: cold + low storage (bullish) vs warm + high storage (bearish)
+        # Simple composite score: -Storage_Z + (-Temp_Bias/20)  (cold bias negative, low storage negative)
+        trade_df["Bullish_Score"] = -trade_df["Storage_Z"] + (-trade_df["Temp_Bias"] / 20.0)
 
+        # Display sorted by Bullish_Score (most bullish first)
+        trade_df_sorted = trade_df.sort_values("Bullish_Score", ascending=False)
+
+        # Formatting
+        display_df = trade_df_sorted.copy()
+        display_df["Storage_Bcf"] = display_df["Storage_Bcf"].round(0).astype(int)
+        display_df["Storage_Z"] = display_df["Storage_Z"].round(2)
+        display_df["NOAA_Prob_Above"] = display_df["NOAA_Prob_Above"].round(0)
+        display_df["NOAA_Prob_Below"] = display_df["NOAA_Prob_Below"].round(0)
+        display_df["Temp_Bias"] = display_df["Temp_Bias"].round(1)
+        display_df["Bullish_Score"] = display_df["Bullish_Score"].round(2)
+
+        st.dataframe(
+            display_df[
+                [
+                    "Region",
+                    "Storage_Bcf",
+                    "Storage_Z",
+                    "Pct_Full",
+                    "NOAA_Prob_Above",
+                    "NOAA_Prob_Below",
+                    "Temp_Bias",
+                    "Bullish_Score",
+                ]
+            ],
+            use_container_width=True,
+        )
+
+        st.caption(
+            "Interpretation: higher Bullish_Score = more supportive for long NG "
+            "(low storage vs history + cold‑biased NOAA outlook). "
+            "Negative scores tilt bearish (high storage + warm‑biased outlook)."
+        )
+    else:
+        st.info("Insufficient data to build regional trade screen.")
+else:
+    st.info("No storage map data available for trade screen.")
