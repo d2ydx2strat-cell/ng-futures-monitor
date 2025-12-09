@@ -10,8 +10,9 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import numpy as np
 import statsmodels.api as sm
+from typing import Dict, Optional
 
-# Geo imports for Section 4
+# Geo imports for Section 5
 import geopandas as gpd
 from shapely.geometry import box
 
@@ -49,7 +50,7 @@ def get_storage_centroids(storage_df_latest=None):
 
 EIA_API_KEY = "KzzwPVmMSTVCI3pQbpL9calvF4CqGgEbwWy0qqXV"
 
-EIA_SERIES = {
+EIA_SERIES: Dict[str, str] = {
     "Lower 48 Total": "NW2_EPG0_SWO_R48_BCF",
     "East": "NW2_EPG0_SWO_R31_BCF",
     "Midwest": "NW2_EPG0_SWO_R32_BCF",
@@ -58,6 +59,14 @@ EIA_SERIES = {
     "South Central Total": "NW2_EPG0_SWO_R35_BCF",
     "South Central Salt": "NW2_EPG0_SSO_R33_BCF",
     "South Central Non-Salt": "NW2_EPG0_SNO_R33_BCF",
+}
+
+# NEW: EIA DAILY SERIES IDs
+EIA_DAILY_SERIES: Dict[str, str] = {
+    # Natural Gas Liquefied (Feed Gas to Export) - Lower 48 States (MMCFD = Million Cubic Feet per Day)
+    "LNG_Feed_Gas_MMCFD": "NG.NOA_C_SUM_SL_A_EPM0_VGM_MMCFD",
+    # Dry Gas Production - Lower 48 States (MMCFD)
+    "Dry_Gas_Production_MMCFD": "NG.RNGR48.D",
 }
 
 REGION_CAPACITY_BCF = {k: None for k in EIA_SERIES.keys()}
@@ -164,7 +173,55 @@ def get_weather_demand():
     final_df.rename(columns={'date': 'date'}, inplace=True)
     return final_df
 
-# --- 3B. NOAA 7‑DAY TEMP ANOMALY BY REGION (api.weather.gov) ---
+# --- 4. DATA SOURCE: DAILY FLOWS (EIA) ---
+@st.cache_data(ttl=3600 * 3)
+def get_eia_daily_flows(api_key: str, series_ids: Dict[str, str], length_days: int = 365) -> Optional[pd.DataFrame]:
+    """
+    Fetches daily EIA Natural Gas flow data (LNG Feed Gas and Production).
+    """
+    base_url = "https://api.eia.gov/v2/natural-gas/nggas/d/data/"
+    all_data = []
+
+    for name, series_id in series_ids.items():
+        params = {
+            "api_key": api_key,
+            "frequency": "daily",
+            "data[0]": "value",
+            "facets[seriesId][]": series_id,
+            "sort[0][column]": "period",
+            "sort[0][direction]": "desc",
+            "offset": 0,
+            "length": length_days,
+        }
+
+        try:
+            r = requests.get(base_url, params=params, timeout=30)
+            data = r.json()
+
+            if 'response' in data and 'data' in data['response'] and data['response']['data']:
+                df = pd.DataFrame(data['response']['data'])
+                df['period'] = pd.to_datetime(df['period'])
+                df['value'] = pd.to_numeric(df['value'], errors='coerce')
+                df.rename(columns={'value': name, 'period': 'date'}, inplace=True)
+                df = df[['date', name]].sort_values('date').set_index('date')
+                all_data.append(df)
+            else:
+                pass 
+                
+        except Exception:
+            continue
+
+    if not all_data:
+        return None
+        
+    final_df = all_data[0].copy()
+    for df in all_data[1:]:
+        final_df = final_df.join(df, how='outer')
+        
+    return final_df.reset_index()
+
+
+# --- 5. NOAA 7‑DAY TEMP ANOMALY BY REGION (api.weather.gov) ---
 @st.cache_data(ttl=3600*3)
 def get_noaa_temp_anomaly_by_region(centroids: dict) -> pd.DataFrame:
     import math
@@ -321,7 +378,7 @@ def load_pipeline_data():
         st.warning("Ensure .shp, .shx, .dbf, .prj (and .cpg) are present in the app directory.")
         return None, None
 
-# --- NEW: WEEKLY MERGED DATA FOR FAIR VALUE MODEL ---
+# --- WEEKLY MERGED DATA FOR FAIR VALUE MODEL ---
 
 @st.cache_data(ttl=3600*24)
 def build_weekly_merged_dataset():
@@ -330,7 +387,7 @@ def build_weekly_merged_dataset():
       - NG1 weekly close
       - Lower 48 storage level, z-score, cum deviation
       - TTF-HH spread (weekly avg)
-      - HDD (weekly sum) and HDD deviation vs 5y avg
+      - HDD (weekly sum) and HDD deviation vs 5y avg (PLACEHOLDER)
     """
     # 1) Storage (Lower 48)
     stor_raw = get_eia_series(EIA_API_KEY, EIA_SERIES["Lower 48 Total"])
@@ -358,9 +415,7 @@ def build_weekly_merged_dataset():
     price_weekly.reset_index(inplace=True)
     price_weekly.rename(columns={'Date': 'week_date'}, inplace=True)
 
-    # 3) HDD historical (approximate using same Open-Meteo but backfill is limited)
-    # For now, we approximate HDD weekly from NG price dates (placeholder).
-    # You can replace this with a proper historical HDD dataset later.
+    # 3) HDD historical (placeholder - needs full integration)
     price_weekly['HDD'] = np.nan  # placeholder
     price_weekly['HDD_Dev'] = np.nan
 
@@ -390,9 +445,13 @@ def fit_fair_value_model(weekly_df: pd.DataFrame):
     model = sm.OLS(y, X).fit()
     df['NG1_FV'] = model.predict(X)
     df['Mispricing'] = df['NG1'] - df['NG1_FV']
+    df['Mispricing_ZScore'] = (df['Mispricing'] - df['Mispricing'].mean()) / df['Mispricing'].std()
     return model, df
 
 # --- MAIN DASHBOARD LOGIC ---
+
+# NEW: Fetch Daily Flow Data
+daily_flows_df = get_eia_daily_flows(EIA_API_KEY, EIA_DAILY_SERIES)
 
 # 1. Prices & Spreads
 st.subheader("1. International Future Spreads (Arbitrage Window)")
@@ -526,7 +585,7 @@ except Exception as e:
 
 st.markdown("---")
 
-# --- 4. FAIR VALUE MODEL SECTION ---
+# 4. FAIR VALUE MODEL SECTION
 st.subheader("4. Storage-Based Fair Value Model for NG1")
 
 weekly_df = build_weekly_merged_dataset()
@@ -537,12 +596,14 @@ else:
 
     latest_row = fv_df.iloc[-1]
     mispricing = latest_row['Mispricing']
+    mispricing_z = latest_row['Mispricing_ZScore']
     mispricing_pctile = (fv_df['Mispricing'] <= mispricing).mean() * 100
 
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric("Current NG1", f"${latest_row['NG1']:.2f}")
-    c2.metric("Model Fair Value", f"${latest_row['NG1_FV']:.2f}", f"Mispricing: {mispricing:+.2f}")
-    c3.metric("Mispricing Percentile", f"{mispricing_pctile:.0f}th", "vs last 5–10 years")
+    c2.metric("Model Fair Value", f"${latest_row['NG1_FV']:.2f}")
+    c3.metric("Mispricing (Actual - FV)", f"{mispricing:+.2f}", f"Z-Score: {mispricing_z:+.2f}")
+    c4.metric("Mispricing Percentile", f"{mispricing_pctile:.0f}th", "vs last 5–10 years")
 
     fig_fv = go.Figure()
     fig_fv.add_trace(go.Scatter(x=fv_df['week_date'], y=fv_df['NG1'], name="NG1 Actual", line=dict(color='blue')))
@@ -558,7 +619,7 @@ else:
 
 st.markdown("---")
 
-# --- 5. U.S. Infrastructure Map (Pipelines, LNG, Storage, NOAA) ---
+# 5. U.S. Infrastructure Map (Pipelines, LNG, Storage, NOAA)
 st.subheader("5. U.S. Infrastructure Map (Pipelines, LNG, Storage, NOAA Outlook)")
 
 REGION_CAPACITY_BCF = {
@@ -568,7 +629,7 @@ REGION_CAPACITY_BCF = {
     "Pacific": 420,
     "South Central Salt": 490,
     "South Central Non-Salt": 980,
-    "South Central Total": 1470 
+    "South Central Total": 1470  
 }
 
 lng_df = get_lng_terminals()
@@ -681,7 +742,7 @@ def create_satellite_map_v2(gdf_pipelines, gdf_boundary, lng_df, storage_points_
                       "<br>Vol: " + storage_points_df['value'].astype(int).astype(str) + " Bcf" +
                       "<br>Full: " + storage_points_df['pct_full'],
             marker=dict(
-                size=storage_points_df['value'] / 12, 
+                size=storage_points_df['value'] / 12,  
                 sizemin=15,
                 color='#003366',
                 opacity=0.8,
@@ -746,8 +807,79 @@ if pipelines_gdf is not None:
 else:
     st.info("Pipeline map components missing.")
 
-# 6. Regional Trade Screen (kept simple for now – can be re‑tuned later)
-st.markdown("### 6. Regional Trade Screen: Storage vs NOAA 7‑Day Outlook")
+st.markdown("---")
+
+# --- 6. REAL-TIME SUPPLY & EXPORT FLOWS ---
+st.subheader("6. Real-Time Supply & LNG Export Flows (Short-Term Balance)")
+
+if daily_flows_df is not None and not daily_flows_df.empty:
+    # Use the last 90 days for flow visualization and calculation
+    flows = daily_flows_df.set_index('date').tail(90).dropna(how='all')
+
+    if 'LNG_Feed_Gas_MMCFD' in flows.columns and 'Dry_Gas_Production_MMCFD' in flows.columns:
+        
+        # --- LNG Flow Analysis ---
+        flows['LNG_MA30'] = flows['LNG_Feed_Gas_MMCFD'].rolling(window=30).mean()
+        latest_lng = flows['LNG_Feed_Gas_MMCFD'].iloc[-1]
+        latest_ma = flows['LNG_MA30'].iloc[-1]
+        flow_delta = latest_lng - latest_ma
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Latest LNG Feed Gas (MMCFD)", f"{latest_lng:,.0f}", help="Daily flow to US liquefaction terminals.")
+        c2.metric("30-Day Avg LNG Flow (MMCFD)", f"{latest_ma:,.0f}")
+        
+        signal_text = "Neutral"
+        if flow_delta < -1000: # Threshold for a significant short-term outage (e.g., > 1 Bcfd)
+            signal_text = "🐻 Bearish: Major Demand Loss"
+        elif flow_delta > 500:
+            signal_text = "🐂 Bullish: Strong Demand"
+            
+        c3.metric("Flow Delta vs 30-Day Avg", f"{flow_delta:,.0f} MMCFD", signal_text)
+        
+        # Plot LNG Flows
+        st.markdown("#### LNG Feed Gas Flow and 30-Day Average (90 Days)")
+        fig_lng = go.Figure()
+        fig_lng.add_trace(go.Scatter(x=flows.index, y=flows['LNG_Feed_Gas_MMCFD'], name="Actual LNG Flow"))
+        fig_lng.add_trace(go.Scatter(x=flows.index, y=flows['LNG_MA30'], name="30-Day Average", line=dict(dash='dash')))
+        fig_lng.update_layout(title="", height=350, margin=dict(t=10, b=10))
+        st.plotly_chart(fig_lng, use_container_width=True)
+
+        st.markdown("---")
+
+        # --- Production Analysis ---
+        st.markdown("#### Lower 48 Dry Gas Production (90 Days)")
+        flows['Prod_MA30'] = flows['Dry_Gas_Production_MMCFD'].rolling(window=30).mean()
+        latest_prod = flows['Dry_Gas_Production_MMCFD'].iloc[-1]
+        latest_prod_ma = flows['Prod_MA30'].iloc[-1]
+        prod_delta = latest_prod - latest_prod_ma
+
+        pc1, pc2, pc3 = st.columns(3)
+        pc1.metric("Latest Production (MMCFD)", f"{latest_prod:,.0f}")
+        pc2.metric("30-Day Avg Production (MMCFD)", f"{latest_prod_ma:,.0f}")
+        
+        prod_signal = "Neutral"
+        if prod_delta > 2000: # Threshold for a new production surge (e.g., > 2 Bcfd)
+            prod_signal = "🐻 Bearish: Strong Supply"
+        elif prod_delta < -1000:
+            prod_signal = "🐂 Bullish: Supply Drop"
+            
+        pc3.metric("Production Delta vs 30-Day Avg", f"{prod_delta:,.0f} MMCFD", prod_signal)
+
+        fig_prod = go.Figure()
+        fig_prod.add_trace(go.Scatter(x=flows.index, y=flows['Dry_Gas_Production_MMCFD'], name="Production"))
+        fig_prod.add_trace(go.Scatter(x=flows.index, y=flows['Prod_MA30'], name="30-Day Average", line=dict(dash='dash')))
+        fig_prod.update_layout(title="", height=350, margin=dict(t=10, b=10))
+        st.plotly_chart(fig_prod, use_container_width=True)
+        
+    else:
+        st.info("Daily flow columns not found in the fetched data.")
+else:
+    st.info("Daily flow data could not be loaded from EIA API.")
+
+st.markdown("---")
+
+# 7. Regional Trade Screen (Original Section 6 now becomes 7)
+st.markdown("### 7. Regional Trade Screen: Storage vs NOAA 7‑Day Outlook")
 
 if not storage_points_df.empty:
     trade_rows = []
@@ -784,6 +916,7 @@ if not storage_points_df.empty:
     if trade_rows:
         trade_df = pd.DataFrame(trade_rows)
 
+        # Actionable Score: Lower Storage Z + Colder Weather (Negative Temp Bias) = More Bullish
         trade_df["Bullish_Score"] = -trade_df["Storage_Z"] + (-trade_df["Temp_Bias_F"] / 5.0)
 
         trade_df_sorted = trade_df.sort_values("Bullish_Score", ascending=False)
@@ -809,15 +942,7 @@ if not storage_points_df.empty:
                     "Bullish_Score",
                 ]
             ],
-            use_container_width=True,
+            hide_index=True
         )
 
-        st.caption(
-            "Higher Bullish_Score = more supportive for long NG "
-            "(low storage vs history + colder‑than‑normal NOAA 7‑day outlook). "
-            "Negative scores tilt bearish (high storage + warm anomaly)."
-        )
-    else:
-        st.info("Insufficient data to build regional trade screen.")
-else:
-    st.info("No storage map data available for trade screen.")
+# ... (End of Code) ...
