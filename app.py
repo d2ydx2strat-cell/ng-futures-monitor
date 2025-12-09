@@ -18,6 +18,49 @@ from shapely.geometry import box
 st.set_page_config(page_title="NG Trading Monitor", layout="wide")
 st.title("🔥 Global NG Spreads, Storage & Weather Monitor")
 
+# --- 5. NEW GEO ASSETS: LNG & STORAGE LOCATIONS ---
+def get_lng_terminals():
+    """
+    Returns a DataFrame of major US LNG Export Terminals.
+    (Hardcoded as these don't change location often)
+    """
+    terminals = [
+        {"Name": "Sabine Pass (Cheniere)", "Lat": 29.742, "Lon": -93.872, "Capacity_Bcfd": 4.6, "Status": "Operating"},
+        {"Name": "Corpus Christi (Cheniere)", "Lat": 27.876, "Lon": -97.280, "Capacity_Bcfd": 2.4, "Status": "Operating"},
+        {"Name": "Cameron LNG", "Lat": 29.803, "Lon": -93.303, "Capacity_Bcfd": 2.0, "Status": "Operating"},
+        {"Name": "Freeport LNG", "Lat": 28.943, "Lon": -95.308, "Capacity_Bcfd": 2.4, "Status": "Operating"},
+        {"Name": "Cove Point (Dominion)", "Lat": 38.386, "Lon": -76.410, "Capacity_Bcfd": 0.8, "Status": "Operating"},
+        {"Name": "Elba Island", "Lat": 32.083, "Lon": -80.996, "Capacity_Bcfd": 0.35, "Status": "Operating"},
+        {"Name": "Calcasieu Pass (Venture Global)", "Lat": 29.771, "Lon": -93.332, "Capacity_Bcfd": 1.5, "Status": "Operating"},
+        {"Name": "Plaquemines (Venture Global)", "Lat": 29.620, "Lon": -89.920, "Capacity_Bcfd": 2.6, "Status": "Under Const."},
+        {"Name": "Golden Pass", "Lat": 29.760, "Lon": -93.920, "Capacity_Bcfd": 2.4, "Status": "Under Const."},
+    ]
+    return pd.DataFrame(terminals)
+
+def get_storage_centroids(storage_df_latest):
+    """
+    Maps the EIA Regions (which we have data for) to approximate geographic centroids 
+    so we can plot 'Bubbles' of inventory on the map.
+    """
+    # Approximate centers of EIA storage regions
+    centroids = {
+        "East": {"Lat": 40.5, "Lon": -78.0}, # PA/NY area
+        "Midwest": {"Lat": 41.0, "Lon": -88.0}, # IL/IN area
+        "Mountain": {"Lat": 42.0, "Lon": -108.0}, # WY/CO area
+        "Pacific": {"Lat": 38.0, "Lon": -121.0}, # NorCal
+        "South Central Salt": {"Lat": 30.0, "Lon": -92.0}, # LA/TX Gulf Coast
+        "South Central Non-Salt": {"Lat": 34.0, "Lon": -99.0}, # TX/OK Panhandle
+    }
+    
+    data = []
+    # We iterate through the specific regions we know we have keys for in EIA_SERIES
+    # Note: We need the *latest* value for each region.
+    # This requires fetching data for ALL regions, not just the selected one.
+    # For performance, we will only map the regions if we have the data.
+    
+    return centroids
+
+
 # IMPORTANT: Replace with your actual EIA key if the default doesn't work.
 EIA_API_KEY = "KzzwPVmMSTVCI3pQbpL9calvF4CqGgEbwWy0qqXV" 
 
@@ -252,104 +295,118 @@ def load_pipeline_data():
         st.warning("Ensure .shp, .shx, .dbf, .prj (and .cpg) are present in the app directory.")
         return None, None
 
-def create_satellite_map(gdf_pipelines: gpd.GeoDataFrame, gdf_boundary: gpd.GeoDataFrame):
+def create_satellite_map(gdf_pipelines, gdf_boundary, lng_df, storage_points_df):
     """
-    Build a Plotly Scattermapbox figure with data overlays.
-    INCLUDES DIAGNOSTICS to fix the 'Black Map' issue.
+    Enhanced Map: Pipelines + LNG Terminals + Storage Bubbles
     """
     import os
     
-    # 1. Try to get token
+    # --- 1. Mapbox Token Logic ---
     mapbox_token = None
     if "MAPBOX_TOKEN" in st.secrets:
         mapbox_token = st.secrets["MAPBOX_TOKEN"]
-    
     if not mapbox_token:
         mapbox_token = os.getenv("MAPBOX_TOKEN")
 
-    # 2. DIAGNOSTIC: Check if token is valid for browser use
-    # Mapbox styles like "satellite" require a Public token (starts with pk.)
-    # If we don't have a valid token, we switch to a free style (Carto) so the map still renders.
+    # Fallback to Carto if no token or invalid token
     use_satellite = False
+    map_style = "carto-darkmatter"
+    
     if mapbox_token and mapbox_token.startswith("pk."):
         use_satellite = True
         map_style = "satellite-streets"
-    else:
-        # Fallback to a style that DOES NOT require a token
-        st.warning("⚠️ Mapbox token missing or invalid (must start with 'pk.'). Switched to 'Carto Dark' style to ensure map visibility.")
-        if mapbox_token and mapbox_token.startswith("sk."):
-            st.error("❌ You are using a Secret Key (sk.). Mapbox in the browser requires a Public Key (pk.).")
-        map_style = "carto-darkmatter" 
-
-    # 3. Prepare data
+    
+    # --- 2. Base Geometry (Pipelines) ---
     pipeline_lons, pipeline_lats = gdf_to_plotly_lines(gdf_pipelines)
-
+    
     try:
         gdf_boundary_4326 = gdf_boundary.to_crs(epsg=4326)
-    except Exception:
-        gdf_boundary_4326 = gdf_boundary
-        
-    center_point = gdf_boundary_4326.geometry.unary_union.centroid
-    center_lat = center_point.y
-    center_lon = center_point.x
+        center_point = gdf_boundary_4326.geometry.unary_union.centroid
+        center_lat = center_point.y
+        center_lon = center_point.x
+    except:
+        center_lat, center_lon = 39.8, -98.6 # Default US Center
 
     fig = go.Figure()
 
-    # Pipelines trace
+    # Layer 1: Pipelines (Thinner line for background context)
     fig.add_trace(
         go.Scattermapbox(
             mode="lines",
             lon=pipeline_lons,
             lat=pipeline_lats,
             name="Pipelines",
-            line=dict(width=2, color="#FF4B4B"), # Streamlit Red
+            line=dict(width=1, color="rgba(255, 75, 75, 0.6)"), # Streamlit Red, semi-transparent
             hoverinfo="none",
         )
     )
 
-    # Boundary layers
-    boundary_geo = gdf_boundary_4326.__geo_interface__ if gdf_boundary_4326 is not None else None
-    layers = []
-    #if boundary_geo is not None:
-     #   layers.extend([
-      #      {"source": boundary_geo, "type": "fill", "color": "rgba(0, 255, 0, 0.0)"},
-       #     {"source": boundary_geo, "type": "line", "color": "yellow", "line": {"width": 2}}
-    #])
+    # Layer 2: LNG Terminals (Green Squares)
+    if not lng_df.empty:
+        fig.add_trace(
+            go.Scattermapbox(
+                mode="markers",
+                lon=lng_df['Lon'],
+                lat=lng_df['Lat'],
+                name="LNG Export Terminals",
+                text=lng_df['Name'] + "<br>Cap: " + lng_df['Capacity_Bcfd'].astype(str) + " Bcfd",
+                marker=dict(
+                    size=12,
+                    color='#00ff00', # Neon Green
+                    symbol='square',
+                    opacity=0.9
+                ),
+                hoverinfo='text'
+            )
+        )
 
-    # 4. Layout
+    # Layer 3: Regional Storage Levels (Blue Bubbles)
+    if storage_points_df is not None and not storage_points_df.empty:
+        # Scale bubble size. Max storage ~1000 Bcf (SC Total) -> Size 40
+        # Min storage ~200 Bcf -> Size 10
+        fig.add_trace(
+            go.Scattermapbox(
+                mode="markers+text",
+                lon=storage_points_df['lon'],
+                lat=storage_points_df['lat'],
+                name="Regional Storage (Bcf)",
+                text=storage_points_df['value'].astype(int).astype(str) + " Bcf",
+                textposition="bottom center",
+                hovertext=storage_points_df['region'] + "<br>Current: " + storage_points_df['value'].astype(str) + " Bcf",
+                marker=dict(
+                    # Logarithmic scaling or simple linear scaling for size
+                    size=storage_points_df['value'] / 25, 
+                    sizemin=8,
+                    color='#3399ff', # Light Blue
+                    opacity=0.6,
+                ),
+                hoverinfo='text'
+            )
+        )
+
+    # --- 3. Layout ---
     layout_args = dict(
-        title="Natural Gas Pipelines",
+        title="Infrastructure Map: Pipelines, LNG Terminals & Storage Hubs",
         mapbox=dict(
             style=map_style,
             center=dict(lat=center_lat, lon=center_lon),
-            zoom=3,
-            layers=layers,
+            zoom=3.5,
         ),
         margin={"r": 0, "t": 40, "l": 0, "b": 0},
-        height=700,
+        height=750,
+        legend=dict(
+            yanchor="top",
+            y=0.99,
+            xanchor="left",
+            x=0.01,
+            bgcolor="rgba(0,0,0,0.5)"
+        )
     )
-
-    # Only pass the token if we are using the satellite style
+    
     if use_satellite:
         layout_args["mapbox_accesstoken"] = mapbox_token
 
     fig.update_layout(**layout_args)
-
-    return fig
-    # IMPORTANT: use `mapbox_accessToken` (camelCase) in layout
-    fig.update_layout(
-        title="Natural Gas Pipelines on Satellite Imagery",
-        mapbox=dict(
-            accesstoken=mapbox_token,          # token goes here
-            style="satellite-streets",         # or "satellite" / "streets"
-            center=dict(lat=center_lat, lon=center_lon),
-            zoom=3,
-            layers=layers,
-        ),
-        margin={"r": 0, "t": 40, "l": 0, "b": 0},
-        height=700,
-    )
-
     return fig
 
 
@@ -491,19 +548,51 @@ except Exception as e:
 
 st.markdown("---")
 
-# --- 4. U.S. Pipeline Map (Satellite) ---
-st.subheader("4. U.S. Pipeline Map (Satellite)")
+# --- 4. U.S. Pipeline & Infrastructure Map ---
+st.subheader("4. U.S. Infrastructure Map (Pipelines, LNG, Storage)")
 
-# Load and render the pipeline map
+# A. Prepare LNG Data
+lng_df = get_lng_terminals()
+
+# B. Prepare Storage Map Data (Need to fetch current values for ALL regions)
+# We use a simplified fetch here just for the latest datapoint to save API calls/time
+storage_map_data = []
+regions_to_map = ["East", "Midwest", "Mountain", "Pacific", "South Central Salt", "South Central Non-Salt"]
+centroids = get_storage_centroids(None) # Get the dict
+
+# Try to fetch latest data for the map (cached)
+with st.spinner("Loading map layers..."):
+    for reg in regions_to_map:
+        # Check if we have this series ID
+        if reg in EIA_SERIES:
+            sid = EIA_SERIES[reg]
+            # Fetch minimal history just to get latest
+            df_reg = get_eia_series(EIA_API_KEY, sid, length_weeks=5) 
+            if df_reg is not None and not df_reg.empty:
+                latest_val = df_reg.iloc[-1]['value']
+                coords = centroids.get(reg)
+                if coords:
+                    storage_map_data.append({
+                        "region": reg,
+                        "value": latest_val,
+                        "lat": coords["Lat"],
+                        "lon": coords["Lon"]
+                    })
+
+storage_points_df = pd.DataFrame(storage_map_data)
+
+# C. Load Pipelines
 pipelines_gdf, boundary_gdf = load_pipeline_data()
-if pipelines_gdf is not None and boundary_gdf is not None:
-    fig_map = create_satellite_map(pipelines_gdf, boundary_gdf)
-    if fig_map is not None:
-        st.plotly_chart(fig_map, use_container_width=True)
+
+# D. Render Map
+if pipelines_gdf is not None:
+    fig_map = create_satellite_map(pipelines_gdf, boundary_gdf, lng_df, storage_points_df)
+    st.plotly_chart(fig_map, use_container_width=True)
 else:
-    st.info("Pipeline map not available. Upload the shapefile components to the app directory and reload.")
+    st.info("Pipeline map components missing. Upload shapefile to view.")
 
 # End of app
+
 
 
 
