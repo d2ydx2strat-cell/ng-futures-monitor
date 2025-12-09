@@ -18,7 +18,7 @@ from shapely.geometry import box
 st.set_page_config(page_title="NG Trading Monitor", layout="wide")
 st.title("🔥 Global NG Spreads, Storage & Weather Monitor")
 
-# --- 5. NEW GEO ASSETS: LNG & STORAGE LOCATIONS ---
+# --- GEO ASSETS: LNG & STORAGE LOCATIONS ---
 def get_lng_terminals():
     """
     Returns a DataFrame of major US LNG Export Terminals.
@@ -37,22 +37,23 @@ def get_lng_terminals():
     ]
     return pd.DataFrame(terminals)
 
-def get_storage_centroids(storage_df_latest):
+def get_storage_centroids(storage_df_latest=None):
     """
-    Maps the EIA Regions (which we have data for) to approximate geographic centroids 
-    so we can plot 'Bubbles' of inventory on the map.
+    Approximate geographic centroids for EIA storage regions.
+    Used for plotting bubbles and NOAA anomalies.
     """
-    # Approximate centers of EIA storage regions
     centroids = {
-        "East": {"Lat": 40.5, "Lon": -78.0}, # PA/NY area
-        "Midwest": {"Lat": 41.0, "Lon": -88.0}, # IL/IN area
-        "Mountain": {"Lat": 42.0, "Lon": -108.0}, # WY/CO area
-        "Pacific": {"Lat": 38.0, "Lon": -121.0}, # NorCal
-        "South Central Salt": {"Lat": 30.0, "Lon": -92.0}, # LA/TX Gulf Coast
+        "East": {"Lat": 40.5, "Lon": -78.0},              # PA/NY area
+        "Midwest": {"Lat": 41.0, "Lon": -88.0},           # IL/IN area
+        "Mountain": {"Lat": 42.0, "Lon": -108.0},         # WY/CO area
+        "Pacific": {"Lat": 38.0, "Lon": -121.0},          # NorCal
+        "South Central Salt": {"Lat": 30.0, "Lon": -92.0},# LA/TX Gulf Coast
         "South Central Non-Salt": {"Lat": 34.0, "Lon": -99.0}, # TX/OK Panhandle
     }
     return centroids
 
+
+# --- CONSTANTS / KEYS ---
 
 # IMPORTANT: Replace with your actual EIA key if the default doesn't work.
 EIA_API_KEY = "KzzwPVmMSTVCI3pQbpL9calvF4CqGgEbwWy0qqXV" 
@@ -74,13 +75,13 @@ REGION_CAPACITY_BCF = {k: None for k in EIA_SERIES.keys()}
 # Path to your shapefile (ensure components are uploaded to the app directory)
 SHAPEFILE_PATH = "Natural_Gas_Interstate_and_Intrastate_Pipelines.shp"
 
-# Sidebar
+# --- SIDEBAR ---
 with st.sidebar:
     st.header("Settings")
     if st.button("Force Refresh Data"):
         st.cache_data.clear()
         st.rerun()
-    show_noaa = st.checkbox("Show NOAA 8–14d Temp Outlook on Map", value=True)
+    show_noaa = st.checkbox("Show NOAA 7‑Day Temp Anomaly on Map", value=True)
 
 # --- 1. DATA SOURCE: PRICES (International Spreads) ---
 @st.cache_data(ttl=3600*24)  # Cache for 24 hours
@@ -176,74 +177,77 @@ def get_weather_demand():
     final_df.rename(columns={'date': 'date'}, inplace=True)
     return final_df
 
-# --- 3B. DATA SOURCE: NOAA CPC 8–14 Day Temp Probability Outlook ---
-
-@st.cache_data(ttl=3600*6)
-def get_noaa_cpc_8_14_temp_prob():
-    import json
-
-    url = (
-        "https://www.cpc.ncep.noaa.gov/products/predictions/814day/"
-        "prob/814temp.newprob.geojson"
-    )
-
-    try:
-        r = requests.get(url, timeout=30)
-        r.raise_for_status()
-        js = r.json()
-        ...
-        return gdf
-
-    except Exception as e:
-        # Downgrade to debug info so the app doesn't look broken
-        st.info("NOAA CPC 8–14d outlook not available (using storage only).")
-        return None
-
-
-
-def aggregate_noaa_to_storage_regions(noaa_gdf: gpd.GeoDataFrame, centroids: dict):
+# --- 3B. NOAA 7‑DAY TEMP ANOMALY BY REGION (api.weather.gov) ---
+@st.cache_data(ttl=3600*3)
+def get_noaa_temp_anomaly_by_region(centroids: dict) -> pd.DataFrame:
     """
-    Map NOAA grid probabilities to EIA storage regions using nearest-neighbour
-    to each region centroid.
+    Use api.weather.gov gridpoint forecasts to estimate a 7-day
+    temperature anomaly for each storage region.
 
-    Returns
-    -------
-    DataFrame with:
-        region, lat, lon, prob_above, prob_below, temp_bias
+    temp_bias = forecast_mean_temp - rough_normal_temp (°F)
+    Positive = warmer than normal, negative = colder.
     """
-    if noaa_gdf is None or noaa_gdf.empty:
-        return pd.DataFrame()
+    import math
 
-    from scipy.spatial import cKDTree
-    pts = np.vstack([noaa_gdf["lon"].values, noaa_gdf["lat"].values]).T
-    tree = cKDTree(pts)
+    def rough_normal_temp(lat, month):
+        """
+        Very rough 'normal' temp by latitude & month (F).
+        You can replace this with a proper climatology later.
+        """
+        base = 65 - (abs(lat) - 30) * 0.8  # cooler as you go north
+        seasonal = 15 * math.cos((month - 7) / 6.0 * math.pi)  # warmest ~July
+        return base + seasonal
 
     rows = []
+
     for region, c in centroids.items():
-        lon_c, lat_c = c["Lon"], c["Lat"]
-        dist, idx = tree.query([lon_c, lat_c], k=10)
-        if np.isscalar(idx):
-            idx = [idx]
+        lat = c["Lat"]
+        lon = c["Lon"]
 
-        sub = noaa_gdf.iloc[idx]
-        pa = sub["prob_above"].mean()
-        pb = sub["prob_below"].mean()
-        temp_bias = pa - pb
+        try:
+            # 1) Resolve point to gridpoint office & gridX/gridY
+            meta_url = f"https://api.weather.gov/points/{lat},{lon}"
+            m = requests.get(meta_url, timeout=15)
+            m.raise_for_status()
+            meta = m.json()
+            forecast_url = meta["properties"]["forecast"]
 
-        rows.append(
-            {
-                "region": region,
-                "lat": lat_c,
-                "lon": lon_c,
-                "prob_above": pa,
-                "prob_below": pb,
-                "temp_bias": temp_bias,
-            }
-        )
+            # 2) Get 7-day forecast (periods are ~12h)
+            f = requests.get(forecast_url, timeout=15)
+            f.raise_for_status()
+            js = f.json()
+            periods = js["properties"]["periods"]
+
+            # Take first 14 periods (~7 days)
+            temps = [p["temperature"] for p in periods[:14] if "temperature" in p]
+            if not temps:
+                continue
+
+            forecast_mean = float(np.mean(temps))
+
+            # Approximate normal based on current month
+            now = datetime.datetime.utcnow()
+            normal = rough_normal_temp(lat, now.month)
+            temp_bias = forecast_mean - normal
+
+            rows.append(
+                {
+                    "region": region,
+                    "lat": lat,
+                    "lon": lon,
+                    "forecast_mean_temp": forecast_mean,
+                    "normal_temp_est": normal,
+                    "temp_bias": temp_bias,
+                }
+            )
+
+        except Exception:
+            # If any region fails, just skip it
+            continue
 
     return pd.DataFrame(rows)
 
-# --- HELPER: STORAGE ANALYTICS TRANSFORMS ---
+# --- STORAGE ANALYTICS TRANSFORMS ---
 def compute_storage_analytics(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df = df.sort_values('period').reset_index(drop=True)
@@ -297,7 +301,7 @@ def compute_storage_analytics(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
-# --- 4. MAP HELPERS (Pipeline Data) ---
+# --- MAP HELPERS (Pipeline Data) ---
 def gdf_to_plotly_lines(gdf: gpd.GeoDataFrame):
     """
     Convert a GeoDataFrame of LineString / MultiLineString geometries
@@ -309,7 +313,7 @@ def gdf_to_plotly_lines(gdf: gpd.GeoDataFrame):
         try:
             gdf = gdf.to_crs(epsg=4326)
         except Exception:
-            pass # Use as is if projection fails
+            pass  # Use as is if projection fails
 
     lons = []
     lats = []
@@ -513,11 +517,10 @@ lng_df = get_lng_terminals()
 
 storage_map_data = []
 regions_to_map = ["East", "Midwest", "Mountain", "Pacific", "South Central Salt", "South Central Non-Salt"]
-centroids = get_storage_centroids(None)
+centroids = get_storage_centroids()
 
-# NOAA regional aggregation
-noaa_gdf = get_noaa_cpc_8_14_temp_prob()
-noaa_regional_df = aggregate_noaa_to_storage_regions(noaa_gdf, centroids)
+# NOAA regional anomaly
+noaa_regional_df = get_noaa_temp_anomaly_by_region(centroids)
 
 with st.spinner("Loading infrastructure layers..."):
     # Fetch latest storage data for the map
@@ -547,17 +550,17 @@ with st.spinner("Loading infrastructure layers..."):
 
 storage_points_df = pd.DataFrame(storage_map_data)
 
-# Merge NOAA bias into storage_points_df
+# Merge NOAA anomaly into storage_points_df
 if not noaa_regional_df.empty and not storage_points_df.empty:
     storage_points_df = storage_points_df.merge(
-        noaa_regional_df[["region", "prob_above", "prob_below", "temp_bias"]],
+        noaa_regional_df[["region", "temp_bias", "forecast_mean_temp", "normal_temp_est"]],
         on="region",
         how="left",
     )
 else:
-    storage_points_df["prob_above"] = np.nan
-    storage_points_df["prob_below"] = np.nan
     storage_points_df["temp_bias"] = np.nan
+    storage_points_df["forecast_mean_temp"] = np.nan
+    storage_points_df["normal_temp_est"] = np.nan
 
 # 3. Load Shapefiles
 pipelines_gdf, boundary_gdf = load_pipeline_data()
@@ -583,7 +586,7 @@ def create_satellite_map_v2(gdf_pipelines, gdf_boundary, lng_df, storage_points_
         gdf_boundary_4326 = gdf_boundary.to_crs(epsg=4326)
         center_point = gdf_boundary_4326.geometry.unary_union.centroid
         center_lat, center_lon = center_point.y, center_point.x
-    except:
+    except Exception:
         center_lat, center_lon = 39.8, -98.6
 
     fig = go.Figure()
@@ -636,34 +639,34 @@ def create_satellite_map_v2(gdf_pipelines, gdf_boundary, lng_df, storage_points_
             hoverinfo='text'
         ))
 
-    # LAYER 4: NOAA 8–14d Temperature Bias
+    # LAYER 4: NOAA 7‑Day Temperature Anomaly
     if show_noaa and storage_points_df is not None and not storage_points_df.empty and "temp_bias" in storage_points_df.columns:
         df_noaa = storage_points_df.dropna(subset=["temp_bias"]).copy()
         if not df_noaa.empty:
-            df_noaa["temp_bias_clipped"] = df_noaa["temp_bias"].clip(-50, 50)
+            df_noaa["temp_bias_clipped"] = df_noaa["temp_bias"].clip(-20, 20)
 
             fig.add_trace(
                 go.Scattermapbox(
                     mode="markers",
                     lon=df_noaa["lon"],
                     lat=df_noaa["lat"],
-                    name="NOAA 8–14d Temp Bias",
+                    name="NOAA 7d Temp Anomaly",
                     hovertext=(
                         df_noaa["region"]
-                        + "<br>Prob Above: " + df_noaa["prob_above"].round(0).astype(int).astype(str) + "%"
-                        + "<br>Prob Below: " + df_noaa["prob_below"].round(0).astype(int).astype(str) + "%"
-                        + "<br>Bias (Above - Below): " + df_noaa["temp_bias"].round(1).astype(str) + " pts"
+                        + "<br>Forecast mean: " + df_noaa["forecast_mean_temp"].round(1).astype(str) + "°F"
+                        + "<br>'Normal' est: " + df_noaa["normal_temp_est"].round(1).astype(str) + "°F"
+                        + "<br>Bias: " + df_noaa["temp_bias"].round(1).astype(str) + "°F"
                     ),
                     marker=dict(
                         size=22,
                         color=df_noaa["temp_bias_clipped"],
                         colorscale=[
-                            [0.0, "rgb(0, 70, 200)"],
-                            [0.5, "rgb(255, 255, 255)"],
-                            [1.0, "rgb(200, 0, 0)"],
+                            [0.0, "rgb(0, 70, 200)"],   # cold
+                            [0.5, "rgb(255, 255, 255)"],# neutral
+                            [1.0, "rgb(200, 0, 0)"],    # warm
                         ],
-                        cmin=-50,
-                        cmax=50,
+                        cmin=-20,
+                        cmax=20,
                         opacity=0.7,
                     ),
                     hoverinfo="text",
@@ -671,7 +674,7 @@ def create_satellite_map_v2(gdf_pipelines, gdf_boundary, lng_df, storage_points_
             )
 
     layout_args = dict(
-        title="US Natural Gas Infrastructure, Storage & NOAA 8–14d Outlook",
+        title="US Natural Gas Infrastructure, Storage & NOAA 7‑Day Outlook",
         mapbox=dict(
             style=map_style,
             center=dict(lat=center_lat, lon=center_lon),
@@ -696,10 +699,9 @@ else:
     st.info("Pipeline map components missing.")
 
 # 6. Regional Trade Screen: Storage vs NOAA Outlook
-st.markdown("### 5. Regional Trade Screen: Storage vs NOAA 8–14d Outlook")
+st.markdown("### 5. Regional Trade Screen: Storage vs NOAA 7‑Day Outlook")
 
 if not storage_points_df.empty:
-    # For each mapped region, also compute latest storage z-score from full history
     trade_rows = []
     for reg in regions_to_map:
         sid = EIA_SERIES.get(reg)
@@ -725,29 +727,26 @@ if not storage_points_df.empty:
                 "Storage_Bcf": level,
                 "Storage_Z": level_z,
                 "Pct_Full": row_map["pct_full"],
-                "NOAA_Prob_Above": row_map.get("prob_above", np.nan),
-                "NOAA_Prob_Below": row_map.get("prob_below", np.nan),
-                "Temp_Bias": row_map.get("temp_bias", np.nan),
+                "Temp_Bias_F": row_map.get("temp_bias", np.nan),
+                "Forecast_Mean_T": row_map.get("forecast_mean_temp", np.nan),
+                "Normal_T_Est": row_map.get("normal_temp_est", np.nan),
             }
         )
 
     if trade_rows:
         trade_df = pd.DataFrame(trade_rows)
 
-        # Rank: cold + low storage (bullish) vs warm + high storage (bearish)
-        # Simple composite score: -Storage_Z + (-Temp_Bias/20)  (cold bias negative, low storage negative)
-        trade_df["Bullish_Score"] = -trade_df["Storage_Z"] + (-trade_df["Temp_Bias"] / 20.0)
+        # Composite score: low storage (negative Z) + cold (negative bias) = bullish
+        trade_df["Bullish_Score"] = -trade_df["Storage_Z"] + (-trade_df["Temp_Bias_F"] / 5.0)
 
-        # Display sorted by Bullish_Score (most bullish first)
         trade_df_sorted = trade_df.sort_values("Bullish_Score", ascending=False)
 
-        # Formatting
         display_df = trade_df_sorted.copy()
         display_df["Storage_Bcf"] = display_df["Storage_Bcf"].round(0).astype(int)
         display_df["Storage_Z"] = display_df["Storage_Z"].round(2)
-        display_df["NOAA_Prob_Above"] = display_df["NOAA_Prob_Above"].round(0)
-        display_df["NOAA_Prob_Below"] = display_df["NOAA_Prob_Below"].round(0)
-        display_df["Temp_Bias"] = display_df["Temp_Bias"].round(1)
+        display_df["Temp_Bias_F"] = display_df["Temp_Bias_F"].round(1)
+        display_df["Forecast_Mean_T"] = display_df["Forecast_Mean_T"].round(1)
+        display_df["Normal_T_Est"] = display_df["Normal_T_Est"].round(1)
         display_df["Bullish_Score"] = display_df["Bullish_Score"].round(2)
 
         st.dataframe(
@@ -757,9 +756,9 @@ if not storage_points_df.empty:
                     "Storage_Bcf",
                     "Storage_Z",
                     "Pct_Full",
-                    "NOAA_Prob_Above",
-                    "NOAA_Prob_Below",
-                    "Temp_Bias",
+                    "Forecast_Mean_T",
+                    "Normal_T_Est",
+                    "Temp_Bias_F",
                     "Bullish_Score",
                 ]
             ],
@@ -767,12 +766,11 @@ if not storage_points_df.empty:
         )
 
         st.caption(
-            "Interpretation: higher Bullish_Score = more supportive for long NG "
-            "(low storage vs history + cold‑biased NOAA outlook). "
-            "Negative scores tilt bearish (high storage + warm‑biased outlook)."
+            "Higher Bullish_Score = more supportive for long NG "
+            "(low storage vs history + colder‑than‑normal NOAA 7‑day outlook). "
+            "Negative scores tilt bearish (high storage + warm anomaly)."
         )
     else:
         st.info("Insufficient data to build regional trade screen.")
 else:
     st.info("No storage map data available for trade screen.")
-
