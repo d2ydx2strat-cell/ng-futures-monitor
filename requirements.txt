@@ -9,4 +9,4 @@ plotly
 numpy
 geopandas
 matplotlib
-statsmodels.api
+statsmodels
