@@ -252,69 +252,90 @@ def load_pipeline_data():
         st.warning("Ensure .shp, .shx, .dbf, .prj (and .cpg) are present in the app directory.")
         return None, None
 
-def create_satellite_map(gdf_pipelines: gpd.GeoDataFrame,
-                         gdf_boundary: gpd.GeoDataFrame):
+def create_satellite_map(gdf_pipelines: gpd.GeoDataFrame, gdf_boundary: gpd.GeoDataFrame):
     """
     Build a Plotly Scattermapbox figure with data overlays.
+    INCLUDES DIAGNOSTICS to fix the 'Black Map' issue.
     """
-
-    # --- A. Mapbox token: pull from secrets OR env var as fallback ---
-    mapbox_token = None
-    try:
-        # Streamlit secrets style
-        if "MAPBOX_TOKEN" in st.secrets:
-            mapbox_token = st.secrets["MAPBOX_TOKEN"]
-    except Exception:
-        pass
-
     import os
+    
+    # 1. Try to get token
+    mapbox_token = None
+    if "MAPBOX_TOKEN" in st.secrets:
+        mapbox_token = st.secrets["MAPBOX_TOKEN"]
+    
     if not mapbox_token:
         mapbox_token = os.getenv("MAPBOX_TOKEN")
 
-    if not mapbox_token:
-        st.error("Mapbox token not found. Set MAPBOX_TOKEN in Streamlit secrets or env vars.")
-        return None
+    # 2. DIAGNOSTIC: Check if token is valid for browser use
+    # Mapbox styles like "satellite" require a Public token (starts with pk.)
+    # If we don't have a valid token, we switch to a free style (Carto) so the map still renders.
+    use_satellite = False
+    if mapbox_token and mapbox_token.startswith("pk."):
+        use_satellite = True
+        map_style = "satellite-streets"
+    else:
+        # Fallback to a style that DOES NOT require a token
+        st.warning("⚠️ Mapbox token missing or invalid (must start with 'pk.'). Switched to 'Carto Dark' style to ensure map visibility.")
+        if mapbox_token and mapbox_token.startswith("sk."):
+            st.error("❌ You are using a Secret Key (sk.). Mapbox in the browser requires a Public Key (pk.).")
+        map_style = "carto-darkmatter" 
 
-    # --- B. Prepare pipeline coordinates ---
+    # 3. Prepare data
     pipeline_lons, pipeline_lats = gdf_to_plotly_lines(gdf_pipelines)
 
     try:
         gdf_boundary_4326 = gdf_boundary.to_crs(epsg=4326)
     except Exception:
         gdf_boundary_4326 = gdf_boundary
-
+        
     center_point = gdf_boundary_4326.geometry.unary_union.centroid
     center_lat = center_point.y
     center_lon = center_point.x
 
-    # --- C. Build figure ---
     fig = go.Figure()
 
+    # Pipelines trace
     fig.add_trace(
         go.Scattermapbox(
             mode="lines",
             lon=pipeline_lons,
             lat=pipeline_lats,
             name="Pipelines",
-            line=dict(width=2, color="red"),
+            line=dict(width=2, color="#FF4B4B"), # Streamlit Red
             hoverinfo="none",
         )
     )
 
-    boundary_geo = (gdf_boundary_4326.__geo_interface__
-                    if gdf_boundary_4326 is not None else None)
+    # Boundary layers
+    boundary_geo = gdf_boundary_4326.__geo_interface__ if gdf_boundary_4326 is not None else None
     layers = []
     if boundary_geo is not None:
         layers.extend([
-            {"source": boundary_geo,
-             "type": "fill",
-             "color": "rgba(0, 255, 0, 0.0)"},
-            {"source": boundary_geo,
-             "type": "line",
-             "color": "yellow",
-             "line": {"width": 2}}
+            {"source": boundary_geo, "type": "fill", "color": "rgba(0, 255, 0, 0.0)"},
+            {"source": boundary_geo, "type": "line", "color": "yellow", "line": {"width": 2}}
         ])
 
+    # 4. Layout
+    layout_args = dict(
+        title="Natural Gas Pipelines",
+        mapbox=dict(
+            style=map_style,
+            center=dict(lat=center_lat, lon=center_lon),
+            zoom=3,
+            layers=layers,
+        ),
+        margin={"r": 0, "t": 40, "l": 0, "b": 0},
+        height=700,
+    )
+
+    # Only pass the token if we are using the satellite style
+    if use_satellite:
+        layout_args["mapbox_accesstoken"] = mapbox_token
+
+    fig.update_layout(**layout_args)
+
+    return fig
     # IMPORTANT: use `mapbox_accessToken` (camelCase) in layout
     fig.update_layout(
         title="Natural Gas Pipelines on Satellite Imagery",
@@ -483,4 +504,5 @@ else:
     st.info("Pipeline map not available. Upload the shapefile components to the app directory and reload.")
 
 # End of app
+
 
