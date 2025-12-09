@@ -9,6 +9,7 @@ from retry_requests import retry
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import numpy as np
+import statsmodels.api as sm
 
 # Geo imports for Section 4
 import geopandas as gpd
@@ -20,10 +21,6 @@ st.title("🔥 Global NG Spreads, Storage & Weather Monitor")
 
 # --- GEO ASSETS: LNG & STORAGE LOCATIONS ---
 def get_lng_terminals():
-    """
-    Returns a DataFrame of major US LNG Export Terminals.
-    (Hardcoded as these don't change location often)
-    """
     terminals = [
         {"Name": "Sabine Pass (Cheniere)", "Lat": 29.742, "Lon": -93.872, "Capacity_Bcfd": 4.6, "Status": "Operating"},
         {"Name": "Corpus Christi (Cheniere)", "Lat": 27.876, "Lon": -97.280, "Capacity_Bcfd": 2.4, "Status": "Operating"},
@@ -38,27 +35,20 @@ def get_lng_terminals():
     return pd.DataFrame(terminals)
 
 def get_storage_centroids(storage_df_latest=None):
-    """
-    Approximate geographic centroids for EIA storage regions.
-    Used for plotting bubbles and NOAA anomalies.
-    """
     centroids = {
-        "East": {"Lat": 40.5, "Lon": -78.0},              # PA/NY area
-        "Midwest": {"Lat": 41.0, "Lon": -88.0},           # IL/IN area
-        "Mountain": {"Lat": 42.0, "Lon": -108.0},         # WY/CO area
-        "Pacific": {"Lat": 38.0, "Lon": -121.0},          # NorCal
-        "South Central Salt": {"Lat": 30.0, "Lon": -92.0},# LA/TX Gulf Coast
-        "South Central Non-Salt": {"Lat": 34.0, "Lon": -99.0}, # TX/OK Panhandle
+        "East": {"Lat": 40.5, "Lon": -78.0},
+        "Midwest": {"Lat": 41.0, "Lon": -88.0},
+        "Mountain": {"Lat": 42.0, "Lon": -108.0},
+        "Pacific": {"Lat": 38.0, "Lon": -121.0},
+        "South Central Salt": {"Lat": 30.0, "Lon": -92.0},
+        "South Central Non-Salt": {"Lat": 34.0, "Lon": -99.0},
     }
     return centroids
 
-
 # --- CONSTANTS / KEYS ---
 
-# IMPORTANT: Replace with your actual EIA key if the default doesn't work.
-EIA_API_KEY = "KzzwPVmMSTVCI3pQbpL9calvF4CqGgEbwWy0qqXV" 
+EIA_API_KEY = "KzzwPVmMSTVCI3pQbpL9calvF4CqGgEbwWy0qqXV"
 
-# EIA weekly working gas series IDs
 EIA_SERIES = {
     "Lower 48 Total": "NW2_EPG0_SWO_R48_BCF",
     "East": "NW2_EPG0_SWO_R31_BCF",
@@ -72,7 +62,6 @@ EIA_SERIES = {
 
 REGION_CAPACITY_BCF = {k: None for k in EIA_SERIES.keys()}
 
-# Path to your shapefile (ensure components are uploaded to the app directory)
 SHAPEFILE_PATH = "Natural_Gas_Interstate_and_Intrastate_Pipelines.shp"
 
 # --- SIDEBAR ---
@@ -84,26 +73,25 @@ with st.sidebar:
     show_noaa = st.checkbox("Show NOAA 7‑Day Temp Anomaly on Map", value=True)
 
 # --- 1. DATA SOURCE: PRICES (International Spreads) ---
-@st.cache_data(ttl=3600*24)  # Cache for 24 hours
+@st.cache_data(ttl=3600*24)
 def get_price_data():
     tickers = ['NG=F', 'TTF=F']
-    data = yf.download(tickers, period="1y", interval="1d")['Close']
+    data = yf.download(tickers, period="5y", interval="1d")['Close']
 
     data.rename(columns={'NG=F': 'HenryHub_USD', 'TTF=F': 'TTF_EUR'}, inplace=True)
 
-    # Get recent FX for EUR->USD
-    fx = yf.download("EURUSD=X", period="1d", interval="1d")['Close'].iloc[-1].item()
+    fx = yf.download("EURUSD=X", period="5y", interval="1d")['Close']
+    fx = fx.reindex(data.index).ffill()
+    data['FX_EURUSD'] = fx
 
-    # Convert TTF (EUR/MWh) to USD/MMBtu approximation
-    data['TTF_USD_MMBtu'] = (data['TTF_EUR'] * fx) / 3.412
-
+    data['TTF_USD_MMBtu'] = (data['TTF_EUR'] * data['FX_EURUSD']) / 3.412
     data['Spread_TTF_HH'] = data['TTF_USD_MMBtu'] - data['HenryHub_USD']
 
-    return data.sort_index(ascending=False)
+    return data.sort_index()
 
 # --- 2. DATA SOURCE: US STORAGE (EIA) ---
 @st.cache_data(ttl=3600*24)
-def get_eia_series(api_key: str, series_id: str, length_weeks: int = 52 * 15) -> pd.DataFrame | None:
+def get_eia_series(api_key: str, series_id: str, length_weeks: int = 52 * 20) -> pd.DataFrame | None:
     url = "https://api.eia.gov/v2/natural-gas/stor/wkly/data/"
 
     params = {
@@ -134,7 +122,7 @@ def get_eia_series(api_key: str, series_id: str, length_weeks: int = 52 * 15) ->
         return None
 
 # --- 3. DATA SOURCE: WEATHER (HDD Forecast) ---
-@st.cache_data(ttl=3600*12)  # Update weather every 12 hours
+@st.cache_data(ttl=3600*12)
 def get_weather_demand():
     cache_session = requests_cache.CachedSession('.cache', expire_after=3600)
     retry_session = retry(cache_session, retries=5, backoff_factor=0.2)
@@ -167,7 +155,6 @@ def get_weather_demand():
 
         df = pd.DataFrame({"date": dates, "temp_c": temp})
         df['temp_f'] = (df['temp_c'] * 9 / 5) + 32
-        # daily HDD per day approximated from hourly temps
         df['HDD'] = df['temp_f'].apply(lambda x: max(0, 65 - x) / 24)
         daily = df.groupby(df['date'].dt.date)['HDD'].sum().reset_index()
         daily['City'] = cities[i]
@@ -180,22 +167,11 @@ def get_weather_demand():
 # --- 3B. NOAA 7‑DAY TEMP ANOMALY BY REGION (api.weather.gov) ---
 @st.cache_data(ttl=3600*3)
 def get_noaa_temp_anomaly_by_region(centroids: dict) -> pd.DataFrame:
-    """
-    Use api.weather.gov gridpoint forecasts to estimate a 7-day
-    temperature anomaly for each storage region.
-
-    temp_bias = forecast_mean_temp - rough_normal_temp (°F)
-    Positive = warmer than normal, negative = colder.
-    """
     import math
 
     def rough_normal_temp(lat, month):
-        """
-        Very rough 'normal' temp by latitude & month (F).
-        You can replace this with a proper climatology later.
-        """
-        base = 65 - (abs(lat) - 30) * 0.8  # cooler as you go north
-        seasonal = 15 * math.cos((month - 7) / 6.0 * math.pi)  # warmest ~July
+        base = 65 - (abs(lat) - 30) * 0.8
+        seasonal = 15 * math.cos((month - 7) / 6.0 * math.pi)
         return base + seasonal
 
     rows = []
@@ -205,27 +181,23 @@ def get_noaa_temp_anomaly_by_region(centroids: dict) -> pd.DataFrame:
         lon = c["Lon"]
 
         try:
-            # 1) Resolve point to gridpoint office & gridX/gridY
             meta_url = f"https://api.weather.gov/points/{lat},{lon}"
             m = requests.get(meta_url, timeout=15)
             m.raise_for_status()
             meta = m.json()
             forecast_url = meta["properties"]["forecast"]
 
-            # 2) Get 7-day forecast (periods are ~12h)
             f = requests.get(forecast_url, timeout=15)
             f.raise_for_status()
             js = f.json()
             periods = js["properties"]["periods"]
 
-            # Take first 14 periods (~7 days)
             temps = [p["temperature"] for p in periods[:14] if "temperature" in p]
             if not temps:
                 continue
 
             forecast_mean = float(np.mean(temps))
 
-            # Approximate normal based on current month
             now = datetime.datetime.utcnow()
             normal = rough_normal_temp(lat, now.month)
             temp_bias = forecast_mean - normal
@@ -242,7 +214,6 @@ def get_noaa_temp_anomaly_by_region(centroids: dict) -> pd.DataFrame:
             )
 
         except Exception:
-            # If any region fails, just skip it
             continue
 
     return pd.DataFrame(rows)
@@ -256,7 +227,6 @@ def compute_storage_analytics(df: pd.DataFrame) -> pd.DataFrame:
     df['year'] = df['period'].dt.year
     df['delta'] = df['value'].diff()
 
-    # Drop the first 5 years of data for a cleaner 5-year average calculation
     start_year = df['year'].min() + 5
     df = df[df['year'] >= start_year].copy()
     
@@ -303,17 +273,13 @@ def compute_storage_analytics(df: pd.DataFrame) -> pd.DataFrame:
 
 # --- MAP HELPERS (Pipeline Data) ---
 def gdf_to_plotly_lines(gdf: gpd.GeoDataFrame):
-    """
-    Convert a GeoDataFrame of LineString / MultiLineString geometries
-    into lon/lat lists suitable for a single Plotly Scattermapbox trace.
-    """
     if gdf is None:
         return [], []
     if gdf.crs != "EPSG:4326":
         try:
             gdf = gdf.to_crs(epsg=4326)
         except Exception:
-            pass  # Use as is if projection fails
+            pass
 
     lons = []
     lats = []
@@ -337,13 +303,8 @@ def gdf_to_plotly_lines(gdf: gpd.GeoDataFrame):
 
 @st.cache_data
 def load_pipeline_data():
-    """
-    Load pipeline shapefile and boundary. Cached.
-    """
     try:
         pipelines_gdf = gpd.read_file(SHAPEFILE_PATH)
-
-        # Build bounding box from total extent
         minx, miny, maxx, maxy = pipelines_gdf.total_bounds
         bbox_polygon = box(minx, miny, maxx, maxy)
 
@@ -360,17 +321,88 @@ def load_pipeline_data():
         st.warning("Ensure .shp, .shx, .dbf, .prj (and .cpg) are present in the app directory.")
         return None, None
 
+# --- NEW: WEEKLY MERGED DATA FOR FAIR VALUE MODEL ---
+
+@st.cache_data(ttl=3600*24)
+def build_weekly_merged_dataset():
+    """
+    Build a weekly DataFrame with:
+      - NG1 weekly close
+      - Lower 48 storage level, z-score, cum deviation
+      - TTF-HH spread (weekly avg)
+      - HDD (weekly sum) and HDD deviation vs 5y avg
+    """
+    # 1) Storage (Lower 48)
+    stor_raw = get_eia_series(EIA_API_KEY, EIA_SERIES["Lower 48 Total"])
+    if stor_raw is None or stor_raw.empty:
+        return None
+    stor = compute_storage_analytics(stor_raw)
+    stor = stor[['period', 'value', 'level_zscore', 'cum_dev_vs_5y', 'delta', 'delta_5y_avg']]
+    stor.rename(columns={
+        'period': 'week_date',
+        'value': 'Storage_Bcf',
+        'level_zscore': 'Storage_Z',
+        'cum_dev_vs_5y': 'CumDev_Bcf',
+        'delta': 'Net_Withdrawal',
+        'delta_5y_avg': 'Net_Withdrawal_5y'
+    }, inplace=True)
+    stor['Net_Withdrawal_Dev'] = stor['Net_Withdrawal'] - stor['Net_Withdrawal_5y']
+
+    # 2) Daily prices & spreads
+    price_df = get_price_data()
+    # NG1 weekly close (Friday or last trading day)
+    ng_weekly = price_df['HenryHub_USD'].resample('W-FRI').last().to_frame('NG1')
+    spread_weekly = price_df['Spread_TTF_HH'].resample('W-FRI').mean().to_frame('TTF_HH_Spread')
+
+    price_weekly = ng_weekly.join(spread_weekly, how='inner')
+    price_weekly.reset_index(inplace=True)
+    price_weekly.rename(columns={'Date': 'week_date'}, inplace=True)
+
+    # 3) HDD historical (approximate using same Open-Meteo but backfill is limited)
+    # For now, we approximate HDD weekly from NG price dates (placeholder).
+    # You can replace this with a proper historical HDD dataset later.
+    price_weekly['HDD'] = np.nan  # placeholder
+    price_weekly['HDD_Dev'] = np.nan
+
+    # 4) Merge storage with price/spreads
+    weekly = pd.merge_asof(
+        stor.sort_values('week_date'),
+        price_weekly.sort_values('week_date'),
+        on='week_date',
+        direction='backward'
+    )
+
+    weekly.dropna(subset=['NG1', 'Storage_Z', 'CumDev_Bcf', 'TTF_HH_Spread'], inplace=True)
+    weekly.reset_index(drop=True, inplace=True)
+
+    return weekly
+
+# --- FAIR VALUE MODEL (STORAGE-BASED) ---
+
+def fit_fair_value_model(weekly_df: pd.DataFrame):
+    """
+    Fit OLS: NG1 = α + β1*Storage_Z + β2*CumDev_Bcf + β3*TTF_HH_Spread
+    """
+    df = weekly_df.dropna(subset=['NG1', 'Storage_Z', 'CumDev_Bcf', 'TTF_HH_Spread']).copy()
+    X = df[['Storage_Z', 'CumDev_Bcf', 'TTF_HH_Spread']]
+    X = sm.add_constant(X)
+    y = df['NG1']
+    model = sm.OLS(y, X).fit()
+    df['NG1_FV'] = model.predict(X)
+    df['Mispricing'] = df['NG1'] - df['NG1_FV']
+    return model, df
+
 # --- MAIN DASHBOARD LOGIC ---
 
 # 1. Prices & Spreads
 st.subheader("1. International Future Spreads (Arbitrage Window)")
 try:
     price_df = get_price_data()
-    latest = price_df.iloc[0]
+    latest = price_df.iloc[-1]
 
     col1, col2, col3 = st.columns(3)
-    col1.metric("Henry Hub (US)", f"${latest['HenryHub_USD']:.2f}", f"{price_df['HenryHub_USD'].diff().iloc[0]:.2f}")
-    col2.metric("TTF Proxy (EU)", f"${latest['TTF_USD_MMBtu']:.2f}", f"{price_df['TTF_USD_MMBtu'].diff().iloc[0]:.2f}")
+    col1.metric("Henry Hub (US)", f"${latest['HenryHub_USD']:.2f}", f"{price_df['HenryHub_USD'].diff().iloc[-1]:.2f}")
+    col2.metric("TTF Proxy (EU)", f"${latest['TTF_USD_MMBtu']:.2f}", f"{price_df['TTF_USD_MMBtu'].diff().iloc[-1]:.2f}")
     col3.metric("Spread (Export Arb)", f"${latest['Spread_TTF_HH']:.2f}", "High spread = Bullish US LNG")
 
     fig_price = make_subplots(specs=[[{"secondary_y": True}]])
@@ -384,7 +416,7 @@ except Exception as e:
 
 st.markdown("---")
 
-# 2. Storage
+# 2. Storage (existing detailed section kept as-is, using selected region)
 st.subheader("2. US Storage Levels (EIA Weekly)")
 
 region_names = list(EIA_SERIES.keys())
@@ -433,7 +465,6 @@ if storage_df is not None and not storage_df.empty:
     display_df = storage_df.tail(display_window_weeks)
     recent = display_df
 
-    # 2A. Storage Level + Fan Chart
     fig_store = go.Figure()
     fig_store.add_trace(go.Scatter(x=display_df['period'], y=display_df['p90'], line=dict(width=0), showlegend=False, hoverinfo='skip'))
     fig_store.add_trace(go.Scatter(x=display_df['period'], y=display_df['p10'], fill='tonexty', fillcolor='rgba(0, 123, 255, 0.1)', line=dict(width=0), name='10–90% band', hoverinfo='skip'))
@@ -444,7 +475,6 @@ if storage_df is not None and not storage_df.empty:
     fig_store.update_layout(title=f"{selected_region} Storage vs Historical Distribution (Last 2 Years)", xaxis_title="Date", yaxis_title="Bcf", height=450, margin=dict(l=10, r=10, t=40, b=10))
     st.plotly_chart(fig_store, use_container_width=True)
 
-    # 2B. Weekly Injection/Withdrawal vs 5-Year Avg
     st.markdown("#### Storage Analytics: Weekly Balances vs History (Last 2 Years)")
 
     fig_delta = go.Figure()
@@ -453,7 +483,6 @@ if storage_df is not None and not storage_df.empty:
     fig_delta.update_layout(title=f"{selected_region}: Weekly Injection/Withdrawal vs 5-Year Average", xaxis_title="Date", yaxis_title="Bcf", height=400, barmode='group', margin=dict(l=10, r=10, t=40, b=10))
     st.plotly_chart(fig_delta, use_container_width=True)
 
-    # 2C. Deviation & Z-Score
     c1, c2 = st.columns(2)
     with c1:
         fig_dev = go.Figure()
@@ -470,7 +499,6 @@ if storage_df is not None and not storage_df.empty:
         fig_z.update_layout(title=f"{selected_region}: Weekly Injection/Withdrawal Z-Score", xaxis_title="Date", yaxis_title="Z-Score", height=300, margin=dict(l=10, r=10, t=40, b=10))
         st.plotly_chart(fig_z, use_container_width=True)
 
-    # 2D. Cumulative Deviation vs 5-Year Avg
     fig_cum = go.Figure()
     for gy, sub in storage_df.groupby('gas_year'):
         if gy >= storage_df['gas_year'].max() - 4:
@@ -484,7 +512,7 @@ else:
 
 st.markdown("---")
 
-# 3. Weather
+# 3. Weather (10-day HDD)
 st.subheader("3. 10-Day HDD Forecast (Gas Demand Proxy)")
 st.write("Projected Heating Degree Days (HDD) for key consumption hubs.")
 try:
@@ -498,10 +526,41 @@ except Exception as e:
 
 st.markdown("---")
 
-# --- 4. U.S. Infrastructure Map (Pipelines, LNG, Storage, NOAA) ---
-st.subheader("4. U.S. Infrastructure Map (Pipelines, LNG, Storage, NOAA Outlook)")
+# --- 4. FAIR VALUE MODEL SECTION ---
+st.subheader("4. Storage-Based Fair Value Model for NG1")
 
-# 1. Update Capacities (Approximate Design Capacity in Bcf for % Calc)
+weekly_df = build_weekly_merged_dataset()
+if weekly_df is None or weekly_df.empty:
+    st.info("Insufficient data to build fair value model.")
+else:
+    model, fv_df = fit_fair_value_model(weekly_df)
+
+    latest_row = fv_df.iloc[-1]
+    mispricing = latest_row['Mispricing']
+    mispricing_pctile = (fv_df['Mispricing'] <= mispricing).mean() * 100
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Current NG1", f"${latest_row['NG1']:.2f}")
+    c2.metric("Model Fair Value", f"${latest_row['NG1_FV']:.2f}", f"Mispricing: {mispricing:+.2f}")
+    c3.metric("Mispricing Percentile", f"{mispricing_pctile:.0f}th", "vs last 5–10 years")
+
+    fig_fv = go.Figure()
+    fig_fv.add_trace(go.Scatter(x=fv_df['week_date'], y=fv_df['NG1'], name="NG1 Actual", line=dict(color='blue')))
+    fig_fv.add_trace(go.Scatter(x=fv_df['week_date'], y=fv_df['NG1_FV'], name="Model Fair Value", line=dict(color='orange')))
+    fig_fv.update_layout(title="NG1 vs Storage-Based Fair Value", xaxis_title="Week", yaxis_title="$/MMBtu", height=450, margin=dict(l=10, r=10, t=40, b=10))
+    st.plotly_chart(fig_fv, use_container_width=True)
+
+    fig_mis = go.Figure()
+    fig_mis.add_trace(go.Bar(x=fv_df['week_date'], y=fv_df['Mispricing'], name="Mispricing (NG1 - FV)", marker_color=fv_df['Mispricing'].apply(lambda x: 'red' if x < 0 else 'green')))
+    fig_mis.add_hline(y=0, line=dict(color='black', width=1))
+    fig_mis.update_layout(title="NG1 Mispricing vs Fair Value", xaxis_title="Week", yaxis_title="$/MMBtu", height=300, margin=dict(l=10, r=10, t=40, b=10))
+    st.plotly_chart(fig_mis, use_container_width=True)
+
+st.markdown("---")
+
+# --- 5. U.S. Infrastructure Map (Pipelines, LNG, Storage, NOAA) ---
+st.subheader("5. U.S. Infrastructure Map (Pipelines, LNG, Storage, NOAA Outlook)")
+
 REGION_CAPACITY_BCF = {
     "East": 950,
     "Midwest": 1100,
@@ -512,18 +571,15 @@ REGION_CAPACITY_BCF = {
     "South Central Total": 1470 
 }
 
-# 2. Map Data Generation
 lng_df = get_lng_terminals()
 
 storage_map_data = []
 regions_to_map = ["East", "Midwest", "Mountain", "Pacific", "South Central Salt", "South Central Non-Salt"]
 centroids = get_storage_centroids()
 
-# NOAA regional anomaly
 noaa_regional_df = get_noaa_temp_anomaly_by_region(centroids)
 
 with st.spinner("Loading infrastructure layers..."):
-    # Fetch latest storage data for the map
     for reg in regions_to_map:
         if reg in EIA_SERIES:
             sid = EIA_SERIES[reg]
@@ -550,7 +606,6 @@ with st.spinner("Loading infrastructure layers..."):
 
 storage_points_df = pd.DataFrame(storage_map_data)
 
-# Merge NOAA anomaly into storage_points_df
 if not noaa_regional_df.empty and not storage_points_df.empty:
     storage_points_df = storage_points_df.merge(
         noaa_regional_df[["region", "temp_bias", "forecast_mean_temp", "normal_temp_est"]],
@@ -562,10 +617,8 @@ else:
     storage_points_df["forecast_mean_temp"] = np.nan
     storage_points_df["normal_temp_est"] = np.nan
 
-# 3. Load Shapefiles
 pipelines_gdf, boundary_gdf = load_pipeline_data()
 
-# 4. Map plotting function (v2 with NOAA layer)
 def create_satellite_map_v2(gdf_pipelines, gdf_boundary, lng_df, storage_points_df, show_noaa=True):
     import os
     mapbox_token = None
@@ -591,7 +644,6 @@ def create_satellite_map_v2(gdf_pipelines, gdf_boundary, lng_df, storage_points_
 
     fig = go.Figure()
 
-    # LAYER 1: Pipelines
     fig.add_trace(go.Scattermapbox(
         mode="lines",
         lon=pipeline_lons,
@@ -601,7 +653,6 @@ def create_satellite_map_v2(gdf_pipelines, gdf_boundary, lng_df, storage_points_
         hoverinfo="none"
     ))
 
-    # LAYER 2: LNG Terminals
     if not lng_df.empty:
         fig.add_trace(go.Scattermapbox(
             mode="markers",
@@ -617,7 +668,6 @@ def create_satellite_map_v2(gdf_pipelines, gdf_boundary, lng_df, storage_points_
             hoverinfo='text'
         ))
 
-    # LAYER 3: Storage Bubbles
     if storage_points_df is not None and not storage_points_df.empty:
         fig.add_trace(go.Scattermapbox(
             mode="markers+text",
@@ -639,7 +689,6 @@ def create_satellite_map_v2(gdf_pipelines, gdf_boundary, lng_df, storage_points_
             hoverinfo='text'
         ))
 
-    # LAYER 4: NOAA 7‑Day Temperature Anomaly
     if show_noaa and storage_points_df is not None and not storage_points_df.empty and "temp_bias" in storage_points_df.columns:
         df_noaa = storage_points_df.dropna(subset=["temp_bias"]).copy()
         if not df_noaa.empty:
@@ -661,9 +710,9 @@ def create_satellite_map_v2(gdf_pipelines, gdf_boundary, lng_df, storage_points_
                         size=22,
                         color=df_noaa["temp_bias_clipped"],
                         colorscale=[
-                            [0.0, "rgb(0, 70, 200)"],   # cold
-                            [0.5, "rgb(255, 255, 255)"],# neutral
-                            [1.0, "rgb(200, 0, 0)"],    # warm
+                            [0.0, "rgb(0, 70, 200)"],
+                            [0.5, "rgb(255, 255, 255)"],
+                            [1.0, "rgb(200, 0, 0)"],
                         ],
                         cmin=-20,
                         cmax=20,
@@ -691,15 +740,14 @@ def create_satellite_map_v2(gdf_pipelines, gdf_boundary, lng_df, storage_points_
     fig.update_layout(**layout_args)
     return fig
 
-# 5. Render map
 if pipelines_gdf is not None:
     fig_map = create_satellite_map_v2(pipelines_gdf, boundary_gdf, lng_df, storage_points_df, show_noaa=show_noaa)
     st.plotly_chart(fig_map, use_container_width=True)
 else:
     st.info("Pipeline map components missing.")
 
-# 6. Regional Trade Screen: Storage vs NOAA Outlook
-st.markdown("### 5. Regional Trade Screen: Storage vs NOAA 7‑Day Outlook")
+# 6. Regional Trade Screen (kept simple for now – can be re‑tuned later)
+st.markdown("### 6. Regional Trade Screen: Storage vs NOAA 7‑Day Outlook")
 
 if not storage_points_df.empty:
     trade_rows = []
@@ -736,7 +784,6 @@ if not storage_points_df.empty:
     if trade_rows:
         trade_df = pd.DataFrame(trade_rows)
 
-        # Composite score: low storage (negative Z) + cold (negative bias) = bullish
         trade_df["Bullish_Score"] = -trade_df["Storage_Z"] + (-trade_df["Temp_Bias_F"] / 5.0)
 
         trade_df_sorted = trade_df.sort_values("Bullish_Score", ascending=False)
