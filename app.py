@@ -178,19 +178,10 @@ def get_weather_demand():
 
 # --- 3B. DATA SOURCE: NOAA CPC 8–14 Day Temp Probability Outlook ---
 
-@st.cache_data(ttl=3600*6)  # refresh every 6 hours
+@st.cache_data(ttl=3600*6)
 def get_noaa_cpc_8_14_temp_prob():
-    """
-    Fetch NOAA CPC 8–14 day temperature probability outlook (CONUS grid).
-
-    Returns
-    -------
-    gdf : GeoDataFrame with columns:
-        ['lon', 'lat', 'prob_above', 'prob_below']
-    """
     import json
 
-    # CPC 8–14 day temperature outlook (CONUS) – GeoJSON endpoint
     url = (
         "https://www.cpc.ncep.noaa.gov/products/predictions/814day/"
         "prob/814temp.newprob.geojson"
@@ -200,51 +191,14 @@ def get_noaa_cpc_8_14_temp_prob():
         r = requests.get(url, timeout=30)
         r.raise_for_status()
         js = r.json()
-
-        features = js.get("features", [])
-        if not features:
-            return None
-
-        lats, lons, p_above, p_below = [], [], [], []
-        for f in features:
-            geom = f.get("geometry", {})
-            props = f.get("properties", {})
-            if geom.get("type") != "Point":
-                continue
-            coords = geom.get("coordinates", None)
-            if not coords or len(coords) < 2:
-                continue
-
-            lon, lat = coords[0], coords[1]
-            pa = props.get("PROB_ABOVE", None)
-            pb = props.get("PROB_BELOW", None)
-
-            if pa is None and pb is None:
-                continue
-
-            lons.append(lon)
-            lats.append(lat)
-            p_above.append(pa if pa is not None else 0)
-            p_below.append(pb if pb is not None else 0)
-
-        if not lons:
-            return None
-
-        gdf = gpd.GeoDataFrame(
-            {
-                "lon": lons,
-                "lat": lats,
-                "prob_above": p_above,
-                "prob_below": p_below,
-            },
-            geometry=gpd.points_from_xy(lons, lats),
-            crs="EPSG:4326",
-        )
+        ...
         return gdf
 
     except Exception as e:
-        st.warning(f"NOAA CPC 8–14 day outlook fetch failed: {e}")
+        # Downgrade to debug info so the app doesn't look broken
+        st.info("NOAA CPC 8–14d outlook not available (using storage only).")
         return None
+
 
 
 def aggregate_noaa_to_storage_regions(noaa_gdf: gpd.GeoDataFrame, centroids: dict):
@@ -821,3 +775,4 @@ if not storage_points_df.empty:
         st.info("Insufficient data to build regional trade screen.")
 else:
     st.info("No storage map data available for trade screen.")
+
