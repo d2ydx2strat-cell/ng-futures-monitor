@@ -310,10 +310,10 @@ def create_satellite_map(gdf_pipelines: gpd.GeoDataFrame, gdf_boundary: gpd.GeoD
     # Boundary layers
     boundary_geo = gdf_boundary_4326.__geo_interface__ if gdf_boundary_4326 is not None else None
     layers = []
-    if boundary_geo is not None:
-        layers.extend([
-            {"source": boundary_geo, "type": "fill", "color": "rgba(0, 255, 0, 0.0)"},
-            {"source": boundary_geo, "type": "line", "color": "yellow", "line": {"width": 2}}
+    #if boundary_geo is not None:
+     #   layers.extend([
+      #      {"source": boundary_geo, "type": "fill", "color": "rgba(0, 255, 0, 0.0)"},
+       #     {"source": boundary_geo, "type": "line", "color": "yellow", "line": {"width": 2}}
         ])
 
     # 4. Layout
@@ -504,5 +504,6 @@ else:
     st.info("Pipeline map not available. Upload the shapefile components to the app directory and reload.")
 
 # End of app
+
 
 
