@@ -360,4 +360,630 @@ def compute_storage_analytics(df: pd.DataFrame) -> pd.DataFrame:
 
     percentiles = grouped['value'].quantile([0.1, 0.25, 0.5, 0.75, 0.9]).unstack(level=1)
     percentiles.columns = ['p10', 'p25', 'p50', 'p75', 'p90']
-    df =
+    df = df.merge(percentiles, on='week_of_year', how='left')
+
+    return df
+
+# --- MAP HELPERS (Pipeline Data) ---
+def gdf_to_plotly_lines(gdf: gpd.GeoDataFrame):
+    if gdf is None:
+        return [], []
+    if gdf.crs != "EPSG:4326":
+        try:
+            gdf = gdf.to_crs(epsg=4326)
+        except Exception:
+            pass
+
+    lons = []
+    lats = []
+
+    for geom in gdf.geometry:
+        if geom is None or getattr(geom, 'is_empty', False):
+            continue
+        if geom.geom_type in ["LineString", "MultiLineString"]:
+            lines = [geom] if geom.geom_type == "LineString" else geom.geoms
+            for line in lines:
+                try:
+                    x, y = line.xy
+                except Exception:
+                    continue
+                lons.extend(list(x))
+                lats.extend(list(y))
+                lons.append(None)
+                lats.append(None)
+
+    return lons, lats
+
+@st.cache_data
+def load_pipeline_data():
+    try:
+        pipelines_gdf = gpd.read_file(SHAPEFILE_PATH)
+        minx, miny, maxx, maxy = pipelines_gdf.total_bounds
+        bbox_polygon = box(minx, miny, maxx, maxy)
+
+        boundary_gdf = gpd.GeoDataFrame(
+            {"name": ["Pipeline Extent"]},
+            geometry=[bbox_polygon],
+            crs=pipelines_gdf.crs,
+        )
+
+        return pipelines_gdf, boundary_gdf
+
+    except Exception as e:
+        st.error(f"Error loading pipeline shapefile: {e}")
+        st.warning("Ensure .shp, .shx, .dbf, .prj (and .cpg) are present in the app directory.")
+        return None, None
+
+# --- NEW: WEEKLY MERGED DATA FOR FAIR VALUE MODEL ---
+
+@st.cache_data(ttl=3600*24)
+def build_weekly_merged_dataset():
+    """
+    Build a weekly DataFrame with:
+      - NG1 weekly close
+      - Lower 48 storage level, z-score, cum deviation
+      - TTF-HH spread (weekly avg)
+      - HDD (weekly sum) and HDD deviation vs 5y avg (placeholder)
+    """
+    # 1) Storage (Lower 48)
+    stor_raw = get_eia_series(EIA_API_KEY, EIA_SERIES["Lower 48 Total"])
+    if stor_raw is None or stor_raw.empty:
+        return None
+    stor = compute_storage_analytics(stor_raw)
+    stor = stor[['period', 'value', 'level_zscore', 'cum_dev_vs_5y', 'delta', 'delta_5y_avg']]
+    stor.rename(columns={
+        'period': 'week_date',
+        'value': 'Storage_Bcf',
+        'level_zscore': 'Storage_Z',
+        'cum_dev_vs_5y': 'CumDev_Bcf',
+        'delta': 'Net_Withdrawal',
+        'delta_5y_avg': 'Net_Withdrawal_5y'
+    }, inplace=True)
+    stor['Net_Withdrawal_Dev'] = stor['Net_Withdrawal'] - stor['Net_Withdrawal_5y']
+
+    # 2) Daily prices & spreads
+    price_df = get_price_data()
+    ng_weekly = price_df['HenryHub_USD'].resample('W-FRI').last().to_frame('NG1')
+    spread_weekly = price_df['Spread_TTF_HH'].resample('W-FRI').mean().to_frame('TTF_HH_Spread')
+
+    price_weekly = ng_weekly.join(spread_weekly, how='inner')
+    price_weekly.reset_index(inplace=True)
+    price_weekly.rename(columns={'Date': 'week_date'}, inplace=True)
+
+    price_weekly['HDD'] = np.nan  # placeholder
+    price_weekly['HDD_Dev'] = np.nan
+
+    weekly = pd.merge_asof(
+        stor.sort_values('week_date'),
+        price_weekly.sort_values('week_date'),
+        on='week_date',
+        direction='backward'
+    )
+
+    weekly.dropna(subset=['NG1', 'Storage_Z', 'CumDev_Bcf', 'TTF_HH_Spread'], inplace=True)
+    weekly.reset_index(drop=True, inplace=True)
+
+    return weekly
+
+# --- FAIR VALUE MODEL (STORAGE-BASED) ---
+
+def fit_fair_value_model(weekly_df: pd.DataFrame):
+    """
+    Fit OLS: NG1 = α + β1*Storage_Z + β2*CumDev_Bcf + β3*TTF_HH_Spread
+    """
+    df = weekly_df.dropna(subset=['NG1', 'Storage_Z', 'CumDev_Bcf', 'TTF_HH_Spread']).copy()
+    X = df[['Storage_Z', 'CumDev_Bcf', 'TTF_HH_Spread']]
+    X = sm.add_constant(X)
+    y = df['NG1']
+    model = sm.OLS(y, X).fit()
+    df['NG1_FV'] = model.predict(X)
+    df['Mispricing'] = df['NG1'] - df['NG1_FV']
+    return model, df
+
+# --- MAIN DASHBOARD LOGIC ---
+
+# 1. Prices & Spreads
+st.subheader("1. International Future Spreads (Arbitrage Window)")
+try:
+    price_df = get_price_data()
+    latest = price_df.iloc[-1]
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Henry Hub (US)", f"${latest['HenryHub_USD']:.2f}", f"{price_df['HenryHub_USD'].diff().iloc[-1]:.2f}")
+    col2.metric("TTF Proxy (EU)", f"${latest['TTF_USD_MMBtu']:.2f}", f"{price_df['TTF_USD_MMBtu'].diff().iloc[-1]:.2f}")
+    col3.metric("Spread (Export Arb)", f"${latest['Spread_TTF_HH']:.2f}", "High spread = Bullish US LNG")
+
+    fig_price = make_subplots(specs=[[{"secondary_y": True}]])
+    fig_price.add_trace(go.Scatter(x=price_df.index, y=price_df['HenryHub_USD'], name="Henry Hub ($)"), secondary_y=False)
+    fig_price.add_trace(go.Scatter(x=price_df.index, y=price_df['TTF_USD_MMBtu'], name="TTF EU ($/MMBtu)"), secondary_y=True)
+    fig_price.update_layout(height=400, margin=dict(l=10, r=10, t=30, b=10))
+    st.plotly_chart(fig_price, use_container_width=True)
+
+except Exception as e:
+    st.warning(f"Could not load price data (Yahoo Finance might be throttling): {e}")
+
+st.markdown("---")
+
+# 2. Storage (existing detailed section)
+st.subheader("2. US Storage Levels (EIA Weekly)")
+
+region_names = list(EIA_SERIES.keys())
+default_region = "Lower 48 Total"
+selected_region = st.selectbox("Select Region / South Central Detail", region_names, index=region_names.index(default_region))
+
+series_id = EIA_SERIES[selected_region]
+capacity_bcf = REGION_CAPACITY_BCF.get(selected_region)
+
+storage_df = get_eia_series(EIA_API_KEY, series_id)
+
+if storage_df is not None and not storage_df.empty:
+    storage_df = compute_storage_analytics(storage_df)
+    latest_storage = storage_df.iloc[-1]
+
+    current_level = latest_storage['value']
+    current_delta = latest_storage['delta']
+    level_5y_avg = latest_storage['level_5y_avg']
+    delta_5y_avg = latest_storage['delta_5y_avg']
+    level_deficit = current_level - level_5y_avg
+    delta_deficit = current_delta - delta_5y_avg
+    level_z = latest_storage['level_zscore']
+
+    s_col1, s_col2, s_col3, s_col4 = st.columns(4)
+    s_col1.metric(f"{selected_region} Working Gas (Bcf)",
+                  f"{current_level:,.0f}",
+                  delta=f"{level_deficit:,.0f} vs 5yr Avg")
+
+    s_col2.metric("Weekly Change (Bcf)",
+                  f"{current_delta:,.0f}",
+                  delta=f"{delta_deficit:,.0f} vs 5yr Avg")
+
+    s_col3.metric("Storage Level Z-Score",
+                  f"{level_z:.2f}" if pd.notna(level_z) else "N/A",
+                  delta="vs hist. week-of-year")
+
+    if capacity_bcf is not None:
+        pct_full = current_level / capacity_bcf * 100
+        s_col4.metric("Utilization (% of Capacity)",
+                      f"{pct_full:.1f}%",
+                      delta=None)
+    else:
+        s_col4.metric("Utilization (% of Capacity)", "N/A", delta=None)
+
+    display_window_weeks = 52 * 2
+    display_df = storage_df.tail(display_window_weeks)
+    recent = display_df
+
+    fig_store = go.Figure()
+    fig_store.add_trace(go.Scatter(x=display_df['period'], y=display_df['p90'], line=dict(width=0), showlegend=False, hoverinfo='skip'))
+    fig_store.add_trace(go.Scatter(x=display_df['period'], y=display_df['p10'], fill='tonexty', fillcolor='rgba(0, 123, 255, 0.1)', line=dict(width=0), name='10–90% band', hoverinfo='skip'))
+    fig_store.add_trace(go.Scatter(x=display_df['period'], y=display_df['p75'], line=dict(width=0), showlegend=False, hoverinfo='skip'))
+    fig_store.add_trace(go.Scatter(x=display_df['period'], y=display_df['p25'], fill='tonexty', fillcolor='rgba(0, 123, 255, 0.2)', line=dict(width=0), name='25–75% band', hoverinfo='skip'))
+    fig_store.add_trace(go.Scatter(x=display_df['period'], y=display_df['p50'], line=dict(color='rgba(0,0,0,0.4)', dash='dash'), name='Median (hist.)'))
+    fig_store.add_trace(go.Scatter(x=display_df['period'], y=display_df['value'], line=dict(color='blue', width=2), name='Actual Storage'))
+    fig_store.update_layout(title=f"{selected_region} Storage vs Historical Distribution (Last 2 Years)", xaxis_title="Date", yaxis_title="Bcf", height=450, margin=dict(l=10, r=10, t=40, b=10))
+    st.plotly_chart(fig_store, use_container_width=True)
+
+    st.markdown("#### Storage Analytics: Weekly Balances vs History (Last 2 Years)")
+
+    fig_delta = go.Figure()
+    fig_delta.add_trace(go.Bar(x=recent['period'], y=recent['delta'], name='Actual Weekly Δ (Bcf)', marker_color=recent['delta'].apply(lambda x: 'red' if x < 0 else 'steelblue')))
+    fig_delta.add_trace(go.Scatter(x=recent['period'], y=recent['delta_5y_avg'], mode='lines', name='5yr Avg Weekly Δ', line=dict(color='black', dash='dash')))
+    fig_delta.update_layout(title=f"{selected_region}: Weekly Injection/Withdrawal vs 5-Year Average", xaxis_title="Date", yaxis_title="Bcf", height=400, barmode='group', margin=dict(l=10, r=10, t=40, b=10))
+    st.plotly_chart(fig_delta, use_container_width=True)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        fig_dev = go.Figure()
+        fig_dev.add_trace(go.Bar(x=recent['period'], y=recent['delta_dev_vs_5y'], name='Δ vs 5yr Avg (Bcf)', marker_color=recent['delta_dev_vs_5y'].apply(lambda x: 'red' if x < 0 else 'green')))
+        fig_dev.update_layout(title=f"{selected_region}: Weekly Deviation vs 5-Year Avg (Bcf)", xaxis_title="Date", yaxis_title="Bcf", height=300, margin=dict(l=10, r=10, t=40, b=10))
+        st.plotly_chart(fig_dev, use_container_width=True)
+
+    with c2:
+        fig_z = go.Figure()
+        fig_z.add_trace(go.Scatter(x=recent['period'], y=recent['delta_zscore'], mode='lines+markers', name='Weekly Δ Z-Score'))
+        fig_z.add_hline(y=0, line=dict(color='black', width=1))
+        fig_z.add_hline(y=1.5, line=dict(color='orange', width=1, dash='dash'))
+        fig_z.add_hline(y=-1.5, line=dict(color='orange', width=1, dash='dash'))
+        fig_z.update_layout(title=f"{selected_region}: Weekly Injection/Withdrawal Z-Score", xaxis_title="Date", yaxis_title="Z-Score", height=300, margin=dict(l=10, r=10, t=40, b=10))
+        st.plotly_chart(fig_z, use_container_width=True)
+
+    fig_cum = go.Figure()
+    for gy, sub in storage_df.groupby('gas_year'):
+        if gy >= storage_df['gas_year'].max() - 4:
+            fig_cum.add_trace(go.Scatter(x=sub['period'], y=sub['cum_dev_vs_5y'], mode='lines', name=f"Gas Year {gy}"))
+    fig_cum.add_hline(y=0, line=dict(color='black', width=1))
+    fig_cum.update_layout(title=f"{selected_region}: Cumulative Deviation vs 5-Year Avg (by Gas Year)", xaxis_title="Date", yaxis_title="Cumulative Δ vs 5-Year Avg (Bcf)", height=400, margin=dict(l=10, r=10, t=40, b=10))
+    st.plotly_chart(fig_cum, use_container_width=True)
+
+else:
+    st.warning(f"⚠️ Could not load storage data for {selected_region}.")
+
+st.markdown("---")
+
+# 3. Weather (10-day HDD)
+st.subheader("3. 10-Day HDD Forecast (Gas Demand Proxy)")
+st.write("Projected Heating Degree Days (HDD) for key consumption hubs.")
+try:
+    weather_df = get_weather_demand()
+    chart_data = weather_df.pivot(index='date', columns='City', values='HDD')
+    st.line_chart(chart_data)
+    total_hdd = chart_data.sum(axis=1)
+    st.metric("Total System Forecast HDD (Next 10 Days)", f"{total_hdd.sum():.0f}")
+except Exception as e:
+    st.error(f"Weather data error: {e}")
+
+st.markdown("---")
+
+# --- 4. FAIR VALUE MODEL SECTION ---
+st.subheader("4. Storage-Based Fair Value Model for NG1")
+
+weekly_df = build_weekly_merged_dataset()
+if weekly_df is None or weekly_df.empty:
+    st.info("Insufficient data to build fair value model.")
+else:
+    model, fv_df = fit_fair_value_model(weekly_df)
+
+    latest_row = fv_df.iloc[-1]
+    mispricing = latest_row['Mispricing']
+    mispricing_pctile = (fv_df['Mispricing'] <= mispricing).mean() * 100
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Current NG1", f"${latest_row['NG1']:.2f}")
+    c2.metric("Model Fair Value", f"${latest_row['NG1_FV']:.2f}", f"Mispricing: {mispricing:+.2f}")
+    c3.metric("Mispricing Percentile", f"{mispricing_pctile:.0f}th", "vs last 5–10 years")
+
+    fig_fv = go.Figure()
+    fig_fv.add_trace(go.Scatter(x=fv_df['week_date'], y=fv_df['NG1'], name="NG1 Actual", line=dict(color='blue')))
+    fig_fv.add_trace(go.Scatter(x=fv_df['week_date'], y=fv_df['NG1_FV'], name="Model Fair Value", line=dict(color='orange')))
+    fig_fv.update_layout(title="NG1 vs Storage-Based Fair Value", xaxis_title="Week", yaxis_title="$/MMBtu", height=450, margin=dict(l=10, r=10, t=40, b=10))
+    st.plotly_chart(fig_fv, use_container_width=True)
+
+    fig_mis = go.Figure()
+    fig_mis.add_trace(go.Bar(x=fv_df['week_date'], y=fv_df['Mispricing'], name="Mispricing (NG1 - FV)", marker_color=fv_df['Mispricing'].apply(lambda x: 'red' if x < 0 else 'green')))
+    fig_mis.add_hline(y=0, line=dict(color='black', width=1))
+    fig_mis.update_layout(title="NG1 Mispricing vs Fair Value", xaxis_title="Week", yaxis_title="$/MMBtu", height=300, margin=dict(l=10, r=10, t=40, b=10))
+    st.plotly_chart(fig_mis, use_container_width=True)
+
+st.markdown("---")
+
+# --- 5. U.S. Infrastructure Map (Pipelines, LNG, Storage, NOAA & 14-Day Forecast) ---
+st.subheader("5. U.S. Infrastructure Map (Pipelines, LNG, Storage, NOAA Outlook & 14‑Day Forecast)")
+
+REGION_CAPACITY_BCF = {
+    "East": 950,
+    "Midwest": 1100,
+    "Mountain": 270,
+    "Pacific": 420,
+    "South Central Salt": 490,
+    "South Central Non-Salt": 980,
+    "South Central Total": 1470 
+}
+
+lng_df = get_lng_terminals()
+
+storage_map_data = []
+regions_to_map = ["East", "Midwest", "Mountain", "Pacific", "South Central Salt", "South Central Non-Salt"]
+centroids = get_storage_centroids()
+
+noaa_regional_df = get_noaa_temp_anomaly_by_region(centroids)
+
+with st.spinner("Loading infrastructure layers..."):
+    for reg in regions_to_map:
+        if reg in EIA_SERIES:
+            sid = EIA_SERIES[reg]
+            df_reg = get_eia_series(EIA_API_KEY, sid, length_weeks=5)
+            
+            if df_reg is not None and not df_reg.empty:
+                latest_val = df_reg.iloc[-1]['value']
+                
+                cap = REGION_CAPACITY_BCF.get(reg)
+                pct_str = "N/A"
+                if cap:
+                    pct = (latest_val / cap) * 100
+                    pct_str = f"{pct:.0f}%"
+
+                coords = centroids.get(reg)
+                if coords:
+                    storage_map_data.append({
+                        "region": reg,
+                        "value": latest_val,
+                        "pct_full": pct_str,
+                        "lat": coords["Lat"],
+                        "lon": coords["Lon"]
+                    })
+
+storage_points_df = pd.DataFrame(storage_map_data)
+
+if not noaa_regional_df.empty and not storage_points_df.empty:
+    storage_points_df = storage_points_df.merge(
+        noaa_regional_df[["region", "temp_bias", "forecast_mean_temp", "normal_temp_est"]],
+        on="region",
+        how="left",
+    )
+else:
+    storage_points_df["temp_bias"] = np.nan
+    storage_points_df["forecast_mean_temp"] = np.nan
+    storage_points_df["normal_temp_est"] = np.nan
+
+# NEW: OpenWeather 14-day forecast for storage regions + slider
+ow_forecast_df = get_openweather_forecast_for_storage_regions(centroids, days=14)
+
+selected_forecast_date = None
+ow_forecast_for_map = pd.DataFrame()
+
+if not ow_forecast_df.empty:
+    forecast_dates = sorted(ow_forecast_df["date"].unique())
+    idx = st.slider(
+        "OpenWeather 14-Day Forecast – Select Day",
+        min_value=0,
+        max_value=len(forecast_dates) - 1,
+        value=0,
+        format="Day %d"
+    )
+    selected_forecast_date = forecast_dates[idx]
+
+    st.caption(
+        f"Showing OpenWeather forecast for **{selected_forecast_date}** "
+        f"(storage regions colored by forecast mean temperature)."
+    )
+
+    ow_forecast_for_map = ow_forecast_df[ow_forecast_df["date"] == selected_forecast_date].copy()
+else:
+    st.info("OpenWeather forecast not available (set OPENWEATHER_API_KEY in Streamlit secrets or env).")
+
+pipelines_gdf, boundary_gdf = load_pipeline_data()
+
+def create_satellite_map_v2(
+    gdf_pipelines,
+    gdf_boundary,
+    lng_df,
+    storage_points_df,
+    show_noaa=True,
+    ow_forecast_df: pd.DataFrame | None = None
+):
+    mapbox_token = None
+    if "MAPBOX_TOKEN" in st.secrets:
+        mapbox_token = st.secrets["MAPBOX_TOKEN"]
+    if not mapbox_token:
+        mapbox_token = os.getenv("MAPBOX_TOKEN")
+
+    use_satellite = False
+    map_style = "carto-darkmatter"
+    if mapbox_token and mapbox_token.startswith("pk."):
+        use_satellite = True
+        map_style = "satellite-streets"
+
+    pipeline_lons, pipeline_lats = gdf_to_plotly_lines(gdf_pipelines)
+    
+    try:
+        gdf_boundary_4326 = gdf_boundary.to_crs(epsg=4326)
+        center_point = gdf_boundary_4326.geometry.unary_union.centroid
+        center_lat, center_lon = center_point.y, center_point.x
+    except Exception:
+        center_lat, center_lon = 39.8, -98.6
+
+    fig = go.Figure()
+
+    # Pipelines
+    fig.add_trace(go.Scattermapbox(
+        mode="lines",
+        lon=pipeline_lons,
+        lat=pipeline_lats,
+        name="Pipelines",
+        line=dict(width=1, color="rgba(255, 50, 50, 0.6)"),
+        hoverinfo="none"
+    ))
+
+    # LNG terminals
+    if not lng_df.empty:
+        fig.add_trace(go.Scattermapbox(
+            mode="markers",
+            lon=lng_df['Lon'],
+            lat=lng_df['Lat'],
+            name="LNG Terminals",
+            text=lng_df['Name'] + "<br>Cap: " + lng_df['Capacity_Bcfd'].astype(str) + " Bcfd",
+            marker=dict(
+                size=12,
+                color='#39FF14',
+                opacity=1.0,
+            ),
+            hoverinfo='text'
+        ))
+
+    # Storage regions (size ~ volume, text = % full)
+    if storage_points_df is not None and not storage_points_df.empty:
+        fig.add_trace(go.Scattermapbox(
+            mode="markers+text",
+            lon=storage_points_df['lon'],
+            lat=storage_points_df['lat'],
+            name="Regional Storage",
+            text=storage_points_df['pct_full'],
+            textposition="middle center",
+            textfont=dict(size=11, color="white", weight="bold"),
+            hovertext=(
+                storage_points_df['region']
+                + "<br>Vol: " + storage_points_df['value'].astype(int).astype(str) + " Bcf"
+                + "<br>Full: " + storage_points_df['pct_full']
+            ),
+            marker=dict(
+                size=storage_points_df['value'] / 12, 
+                sizemin=15,
+                color='#003366',
+                opacity=0.8,
+            ),
+            hoverinfo='text'
+        ))
+
+    # NOAA 7d anomaly layer
+    if show_noaa and storage_points_df is not None and not storage_points_df.empty and "temp_bias" in storage_points_df.columns:
+        df_noaa = storage_points_df.dropna(subset=["temp_bias"]).copy()
+        if not df_noaa.empty:
+            df_noaa["temp_bias_clipped"] = df_noaa["temp_bias"].clip(-20, 20)
+
+            fig.add_trace(
+                go.Scattermapbox(
+                    mode="markers",
+                    lon=df_noaa["lon"],
+                    lat=df_noaa["lat"],
+                    name="NOAA 7d Temp Anomaly",
+                    hovertext=(
+                        df_noaa["region"]
+                        + "<br>Forecast mean: " + df_noaa["forecast_mean_temp"].round(1).astype(str) + "°F"
+                        + "<br>'Normal' est: " + df_noaa["normal_temp_est"].round(1).astype(str) + "°F"
+                        + "<br>Bias: " + df_noaa["temp_bias"].round(1).astype(str) + "°F"
+                    ),
+                    marker=dict(
+                        size=22,
+                        color=df_noaa["temp_bias_clipped"],
+                        colorscale=[
+                            [0.0, "rgb(0, 70, 200)"],
+                            [0.5, "rgb(255, 255, 255)"],
+                            [1.0, "rgb(200, 0, 0)"],
+                        ],
+                        cmin=-20,
+                        cmax=20,
+                        opacity=0.7,
+                    ),
+                    hoverinfo="text",
+                )
+            )
+
+    # OpenWeather 14-day forecast overlay (per selected day)
+    if ow_forecast_df is not None and not ow_forecast_df.empty:
+        df_ow = ow_forecast_df.copy()
+        df_ow["temp_f_clipped"] = df_ow["temp_f"].clip(-10, 100)
+
+        fig.add_trace(
+            go.Scattermapbox(
+                mode="markers",
+                lon=df_ow["lon"],
+                lat=df_ow["lat"],
+                name="OpenWeather 14d Forecast (Temp)",
+                hovertext=(
+                    df_ow["region"]
+                    + "<br>Date: " + df_ow["date"].astype(str)
+                    + "<br>Tmean: " + df_ow["temp_f"].round(1).astype(str) + "°F"
+                    + "<br>Tmin/Tmax: "
+                    + df_ow["temp_min_f"].round(1).astype(str) + " / "
+                    + df_ow["temp_max_f"].round(1).astype(str) + "°F"
+                    + "<br>HDD: " + df_ow["HDD"].round(1).astype(str)
+                    + "<br>POP: " + (df_ow["pop"].fillna(0) * 100).round(0).astype(str) + "%"
+                ),
+                marker=dict(
+                    size=26,
+                    color=df_ow["temp_f_clipped"],
+                    colorscale="Turbo",
+                    cmin=-10,
+                    cmax=100,
+                    opacity=0.75,
+                ),
+                hoverinfo="text",
+            )
+        )
+
+    layout_args = dict(
+        title="US Natural Gas Infrastructure, Storage, NOAA 7‑Day & 14‑Day Forecast",
+        mapbox=dict(
+            style=map_style,
+            center=dict(lat=center_lat, lon=center_lon),
+            zoom=3.5,
+        ),
+        margin={"r": 0, "t": 30, "l": 0, "b": 0},
+        height=750,
+        legend=dict(x=0.01, y=0.99, bgcolor="rgba(0,0,0,0.5)", font=dict(color="white"))
+    )
+    
+    if use_satellite:
+        layout_args["mapbox_accesstoken"] = mapbox_token
+
+    fig.update_layout(**layout_args)
+    return fig
+
+if pipelines_gdf is not None:
+    fig_map = create_satellite_map_v2(
+        pipelines_gdf,
+        boundary_gdf,
+        lng_df,
+        storage_points_df,
+        show_noaa=show_noaa,
+        ow_forecast_df=ow_forecast_for_map
+    )
+    st.plotly_chart(fig_map, use_container_width=True)
+else:
+    st.info("Pipeline map components missing.")
+
+# 6. Regional Trade Screen
+st.markdown("### 6. Regional Trade Screen: Storage vs NOAA 7‑Day Outlook")
+
+if not storage_points_df.empty:
+    trade_rows = []
+    for reg in regions_to_map:
+        sid = EIA_SERIES.get(reg)
+        if not sid:
+            continue
+        df_reg_full = get_eia_series(EIA_API_KEY, sid, length_weeks=52*15)
+        if df_reg_full is None or df_reg_full.empty:
+            continue
+        df_reg_full = compute_storage_analytics(df_reg_full)
+        latest_row = df_reg_full.iloc[-1]
+
+        level_z = latest_row.get("level_zscore", np.nan)
+        level = latest_row.get("value", np.nan)
+
+        row_map = storage_points_df[storage_points_df["region"] == reg]
+        if row_map.empty:
+            continue
+        row_map = row_map.iloc[0]
+
+        trade_rows.append(
+            {
+                "Region": reg,
+                "Storage_Bcf": level,
+                "Storage_Z": level_z,
+                "Pct_Full": row_map["pct_full"],
+                "Temp_Bias_F": row_map.get("temp_bias", np.nan),
+                "Forecast_Mean_T": row_map.get("forecast_mean_temp", np.nan),
+                "Normal_T_Est": row_map.get("normal_temp_est", np.nan),
+            }
+        )
+
+    if trade_rows:
+        trade_df = pd.DataFrame(trade_rows)
+
+        trade_df["Bullish_Score"] = -trade_df["Storage_Z"] + (-trade_df["Temp_Bias_F"] / 5.0)
+
+        trade_df_sorted = trade_df.sort_values("Bullish_Score", ascending=False)
+
+        display_df = trade_df_sorted.copy()
+        display_df["Storage_Bcf"] = display_df["Storage_Bcf"].round(0).astype(int)
+        display_df["Storage_Z"] = display_df["Storage_Z"].round(2)
+        display_df["Temp_Bias_F"] = display_df["Temp_Bias_F"].round(1)
+        display_df["Forecast_Mean_T"] = display_df["Forecast_Mean_T"].round(1)
+        display_df["Normal_T_Est"] = display_df["Normal_T_Est"].round(1)
+        display_df["Bullish_Score"] = display_df["Bullish_Score"].round(2)
+
+        st.dataframe(
+            display_df[
+                [
+                    "Region",
+                    "Storage_Bcf",
+                    "Storage_Z",
+                    "Pct_Full",
+                    "Forecast_Mean_T",
+                    "Normal_T_Est",
+                    "Temp_Bias_F",
+                    "Bullish_Score",
+                ]
+            ],
+            use_container_width=True,
+        )
+
+        st.caption(
+            "Higher Bullish_Score = more supportive for long NG "
+            "(low storage vs history + colder‑than‑normal NOAA 7‑day outlook). "
+            "Negative scores tilt bearish (high storage + warm anomaly)."
+        )
+    else:
+        st.info("Insufficient data to build regional trade screen.")
+else:
+    st.info("No storage map data available for trade screen.")
