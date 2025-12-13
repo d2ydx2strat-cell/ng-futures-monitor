@@ -6,7 +6,7 @@ import numpy as np
 import os # <-- ADDED: For secure API key retrieval
 
 # Import functions from custom modules
-from constants import EIA_SERIES, REGION_CAPACITY_BCF, get_storage_centroids
+from constants import (EIA_SERIES, REGION_CAPACITY_BCF, get_storage_centroids, GOOGLE_WEATHER_API_KEY)
 from data_loader import (
     get_price_data,
     get_eia_series,
