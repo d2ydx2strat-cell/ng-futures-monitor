@@ -294,19 +294,29 @@ def load_pipeline_data():
 
 
 # The base URL for the daily forecast endpoint
-DAILY_FORECAST_URL = "https://weather.googleapis.com/v1/forecast/days:lookup"
+HOURLY_FORECAST_URL = "https://weather.googleapis.com/v1/forecast/hourly:lookup"
 
+def get_google_hourly_forecast_for_locations(locations_dict: dict, api_key: str) -> pd.DataFrame:
+    """
+    Fetches the up to 10-day hourly weather forecast for multiple locations.
+    """
+    all_data = []
+    
+    session = requests.Session()
+    session.headers.update({"Accept": "application/json"})
+    
+    if not api_key: # Check if the passed key is empty/None
+        print("Warning: Google Weather API Key is missing.")
+        return pd.DataFrame()
 
-def get_google_weather_forecast(lat: float, lon: float, api_key: str) -> pd.DataFrame:
-    """
-    Fetches the 10-day daily forecast from the Google Maps Platform Weather API
-    for a given latitude and longitude.
-    """
-    params = {
-        "location.latitude": lat,
-        "location.longitude": lon,
-        "key": api_key,
-    }
+    for region, coords in locations_dict.items():
+        # ... existing code ...
+        
+        params = {
+            "location.latitude": lat,
+            "location.longitude": lon,
+            "key": api_key, # <-- Use the key passed as an argument
+        }
 
     try:
         # Use your existing session setup for caching if available, otherwise use requests.get
