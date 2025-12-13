@@ -323,7 +323,7 @@ def get_google_weather_forecast(locations_dict: dict, api_key: str) -> pd.DataFr
                     else:
                         continue
                         
-                    temp_f = h.get("temp", {}).get("value")
+                    temp_f = h.get("temperature", {}).get("value")
                     
                     # Google reports in Celsius, you need to convert to Fahrenheit
                     if temp_f is not None:
