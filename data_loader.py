@@ -11,6 +11,7 @@ import openmeteo_requests
 import numpy as np
 import geopandas as gpd
 from shapely.geometry import box
+import streamlit as st
 
 # Import safe constants only
 from constants import EIA_API_KEY, SHAPEFILE_PATH, get_storage_centroids
