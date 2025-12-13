@@ -6,7 +6,7 @@ import os
 # NOTE: In a real-world scenario, keys should be loaded from environment
 # variables or Streamlit secrets, not hardcoded.
 EIA_API_KEY = "KzzwPVmMSTVCI3pQbpL9calvF4CqGgEbwWy0qqXV"
-OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
+OPENWEATHER_API_KEY = os.getenv("e517ec7aecc657a3c578d26b6337c50d")
 
 # --- EIA STORAGE SERIES IDs ---
 EIA_SERIES = {
