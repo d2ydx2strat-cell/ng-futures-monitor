@@ -17,7 +17,7 @@ import streamlit as st
 from constants import EIA_API_KEY, SHAPEFILE_PATH, get_storage_centroids
 
 # --- API Endpoints ---
-HOURLY_FORECAST_URL = "https://weather.googleapis.com/v1/forecast/hourly:lookup"
+HOURLY_FORECAST_URL = "https://weather.googleapis.com/v1/forecast/hours:lookup"
 
 # --- 1. Price Data ---
 @st.cache_data(ttl=3600*24)
