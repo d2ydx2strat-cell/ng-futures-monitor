@@ -3,6 +3,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import requests
 import os # <-- ADDED: For secure API key retrieval
 
 # Import functions from custom modules
