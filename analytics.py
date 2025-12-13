@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 import statsmodels.api as sm
 import streamlit as st
+import geopandas as gpd
 
 from data_loader import get_eia_series, get_price_data
 from constants import EIA_SERIES
