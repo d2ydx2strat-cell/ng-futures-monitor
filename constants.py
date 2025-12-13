@@ -7,6 +7,7 @@ import os
 # variables or Streamlit secrets, not hardcoded.
 EIA_API_KEY = "KzzwPVmMSTVCI3pQbpL9calvF4CqGgEbwWy0qqXV"
 OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
+GOOGLE_WEATHER_API_KEY = st.secrets.get("GOOGLE_WEATHER_API_KEY", os.getenv("GOOGLE_WEATHER_API_KEY", None))
 
 # --- EIA STORAGE SERIES IDs ---
 EIA_SERIES = {
