@@ -233,56 +233,87 @@ def get_openweather_forecast_for_storage_regions(
 
 # --- 6. Google Weather Hourly Forecast (The Function that needs the key passed) ---
 
-@st.cache_data(ttl=3600*3)
+HOURLY_FORECAST_URL = "https://weather.googleapis.com/v1/forecast/hours:lookup" # Corrected endpoint
+
+@st.cache_data(ttl=3600 * 3)
 def get_google_weather_forecast(locations_dict: dict, api_key: str) -> pd.DataFrame:
     """
-    Fetches the up to 10-day hourly weather forecast for multiple locations using Google Weather API.
+    Pulls 10-day hourly forecast from Google Weather API for specific locations.
     """
-    all_data = []
-    
-    session = requests.Session()
-    session.headers.update({"Accept": "application/json"})
-    
     if not api_key:
-        # Key missing check
+        st.error("Could not retrieve hourly forecast data. Google Weather API Key is missing.")
         return pd.DataFrame()
 
-    for region, coords in locations_dict.items():
-        lat = coords["Lat"] 
-        lon = coords["Lon"] 
+    rows = []
+    
+    # Use a generic name for regions since Google API doesn't use the EIA ones
+    region_names = {
+        "East": "East",
+        "Midwest": "Midwest",
+        "Mountain": "Mountain",
+        "Pacific": "Pacific",
+        "South Central Salt": "SC-Salt",
+        "South Central Non-Salt": "SC-NonSalt",
+    }
+    
+    # Iterate through all location centroids
+    for region, c in locations_dict.items():
+        if region not in region_names: continue
+            
+        lat = c["Lat"]
+        lon = c["Lon"]
         
         params = {
-            "location.latitude": lat,
-            "location.longitude": lon,
             "key": api_key,
+            "location.latitude": lat,
+            "location.longitude": lon
         }
 
         try:
-            response = session.get(HOURLY_FORECAST_URL, params=params)
-            response.raise_for_status()
-            data = response.json()
+            r = requests.get(HOURLY_FORECAST_URL, params=params, timeout=20)
+            r.raise_for_status() 
+            js = r.json()
+
+            if "hours" in js:
+                for h in js["hours"]:
+                    
+                    # Convert 'hours.forecastTime' (e.g., '2025-12-14T01:00:00Z') to datetime
+                    time_str = h.get("forecastTime")
+                    if time_str:
+                        dt = datetime.datetime.fromisoformat(time_str.replace('Z', '+00:00'))
+                    else:
+                        continue
+                        
+                    temp_f = h.get("temp", {}).get("value")
+                    
+                    # Google reports in Celsius, you need to convert to Fahrenheit
+                    if temp_f is not None:
+                         temp_f = (temp_f * 9/5) + 32
+                    
+                    rows.append({
+                        "Region": region_names[region],
+                        "Date_Time": dt,
+                        "Latitude": lat,
+                        "Longitude": lon,
+                        "Temperature_F": temp_f,
+                        # Add other fields as needed (e.g., condition, wind)
+                    })
+
+        except requests.exceptions.HTTPError as e:
+            # Catch specific HTTP errors (like 403 Forbidden or 400 Bad Request)
+            st.warning(f"Google API Error for {region}: {e}")
+            continue
         except requests.exceptions.RequestException:
+            # Catch connection/timeout errors
             continue
 
-        if not data or 'hourlyForecasts' not in data:
-            continue
+    if not rows:
+        st.error("Could not retrieve hourly forecast data. Check your Google Weather API Key and ensure the Weather API is enabled in your Google Cloud Project.")
+        return pd.DataFrame()
 
-        for hour_data in data['hourlyForecasts']:
-            time_str = hour_data.get('forecastTime')
-            temp_c = hour_data.get('temperature', {}).get('value')
-            
-            if time_str and temp_c is not None:
-                temp_f = (temp_c * 9/5) + 32
-                
-                all_data.append({
-                    "Date_Time": pd.to_datetime(time_str).tz_localize(None),
-                    "Region": region,
-                    "Latitude": lat,
-                    "Longitude": lon,
-                    "Temperature_F": round(temp_f, 1),
-                })
-                
-    return pd.DataFrame(all_data)
+    df = pd.DataFrame(rows)
+    df.sort_values(["Date_Time", "Region"], inplace=True)
+    return df
 
 
 # --- 7. Load Pipeline Data (Geo) ---
