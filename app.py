@@ -13,6 +13,7 @@ from data_loader import (
     get_noaa_temp_anomaly_by_region,
     get_openweather_forecast_for_storage_regions,
     load_pipeline_data,
+    get_google_weather_forecast,
 )
 from analytics import (
     compute_storage_analytics,
@@ -335,3 +336,18 @@ if not storage_points_df.empty:
         st.info("Insufficient data to build regional trade screen.")
 else:
     st.info("No storage map data available for trade screen.")
+
+# --- NEW SECTION: Fetching Google Weather Data (Example) ---
+from constants import GOOGLE_WEATHER_API_KEY, STORAGE_CENTROIDS # Ensure GOOGLE_WEATHER_API_KEY is available
+
+# Assuming you want the forecast for a specific storage region, e.g., the Henry Hub area.
+# You would need to iterate through all your STORAGE_CENTROIDS to get data for all regions.
+if GOOGLE_WEATHER_API_KEY and STORAGE_CENTROIDS:
+    # Example for one region (e.g., Henry Hub)
+    henry_hub_coords = STORAGE_CENTROIDS["Henry Hub"]
+    google_forecast_df = get_google_weather_forecast(
+        lat=henry_hub_coords["lat"],
+        lon=henry_hub_coords["lon"],
+        api_key=GOOGLE_WEATHER_API_KEY,
+    )
+    
