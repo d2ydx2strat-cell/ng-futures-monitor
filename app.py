@@ -267,6 +267,163 @@ else:
 
 st.markdown("---")
 
+HOURLY_FORECAST_URL = "https://weather.googleapis.com/v1/forecast/hours:lookup" # Corrected endpoint
+
+@st.cache_data(ttl=3600 * 3)
+def get_google_weather_forecast(locations_dict: dict, api_key: str) -> pd.DataFrame:
+    """
+    Pulls 10-day hourly forecast from Google Weather API for specific locations.
+    """
+    if not api_key:
+        st.error("Could not retrieve hourly forecast data. Google Weather API Key is missing.")
+        return pd.DataFrame()
+
+    rows = []
+    
+    # Use a generic name for regions since Google API doesn't use the EIA ones
+    region_names = {
+        "East": "East",
+        "Midwest": "Midwest",
+        "Mountain": "Mountain",
+        "Pacific": "Pacific",
+        "South Central Salt": "SC-Salt",
+        "South Central Non-Salt": "SC-NonSalt",
+    }
+    
+    # Iterate through all location centroids
+    for region, c in locations_dict.items():
+        if region not in region_names: continue
+            
+        lat = c["Lat"]
+        lon = c["Lon"]
+        
+        params = {
+            "key": api_key,
+            "location.latitude": lat,
+            "location.longitude": lon
+        }
+
+        try:
+            r = requests.get(HOURLY_FORECAST_URL, params=params, timeout=20)
+            r.raise_for_status() 
+            js = r.json()
+
+            if "hours" in js:
+                for h in js["hours"]:
+                    
+                    # Convert 'hours.forecastTime' (e.g., '2025-12-14T01:00:00Z') to datetime
+                    time_str = h.get("forecastTime")
+                    if time_str:
+                        dt = datetime.datetime.fromisoformat(time_str.replace('Z', '+00:00'))
+                    else:
+                        continue
+                        
+                    temp_f = h.get("temp", {}).get("value")
+                    
+                    # Google reports in Celsius, you need to convert to Fahrenheit
+                    if temp_f is not None:
+                         temp_f = (temp_f * 9/5) + 32
+                    
+                    rows.append({
+                        "Region": region_names[region],
+                        "Date_Time": dt,
+                        "Latitude": lat,
+                        "Longitude": lon,
+                        "Temperature_F": temp_f,
+                        # Add other fields as needed (e.g., condition, wind)
+                    })
+
+        except requests.exceptions.HTTPError as e:
+            # Catch specific HTTP errors (like 403 Forbidden or 400 Bad Request)
+            st.warning(f"Google API Error for {region}: {e}")
+            continue
+        except requests.exceptions.RequestException:
+            # Catch connection/timeout errors
+            continue
+
+    if not rows:
+        st.error("Could not retrieve hourly forecast data. Check your Google Weather API Key and ensure the Weather API is enabled in your Google Cloud Project.")
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+    df.sort_values(["Date_Time", "Region"], inplace=True)
+    return df
+3. Add the Display Section (Section 6)
+The original issue was due to missing files/imports, which led to the removal of the entire Section 6. Now you need to re-add the new Section 6 to app.py (after the map section, around line 770).
+
+Python
+
+# app.py
+
+# ... (End of Section 5 Map Logic) ...
+
+# 6. GOOGLE AI FORECAST MAP (Hourly with Time Slider)
+st.markdown("---")
+st.subheader("6. Google AI 10-Day Hourly Forecast (High-Resolution)")
+
+hourly_forecast_df = get_google_weather_forecast(centroids, GOOGLE_WEATHER_API_KEY)
+
+if not hourly_forecast_df.empty:
+    all_timestamps = sorted(hourly_forecast_df["Date_Time"].unique())
+    
+    time_slider_idx = st.slider(
+        "Select Time Slot",
+        min_value=0,
+        max_value=len(all_timestamps) - 1,
+        value=0,
+        format="%Y-%m-%d %H:%M %Z"
+    )
+    selected_timestamp = all_timestamps[time_slider_idx]
+
+    # You will need to re-add the plot_forecast_map_with_slider function 
+    # to your visualization logic, similar to the OpenWeather map function.
+    # Since you don't have a visualization.py, you need to integrate this:
+    
+    # 6A. Display the Map (Inline Plotting Function)
+    
+    df_filtered = hourly_forecast_df[hourly_forecast_df['Date_Time'] == selected_timestamp].copy()
+    
+    if not df_filtered.empty:
+        temp_min = hourly_forecast_df['Temperature_F'].min()
+        temp_max = hourly_forecast_df['Temperature_F'].max()
+        clip_min = max(-10, temp_min - 5)
+        clip_max = min(100, temp_max + 5)
+        df_filtered["Temperature_F_Clipped"] = df_filtered["Temperature_F"].clip(clip_min, clip_max)
+
+        fig_google = go.Figure(go.Scattermapbox(
+            mode="markers",
+            lon=df_filtered['Longitude'],
+            lat=df_filtered['Latitude'],
+            text=df_filtered['Region'] + "<br>" + df_filtered['Temperature_F'].round(1).astype(str) + "°F",
+            hoverinfo='text',
+            marker=dict(
+                size=20,
+                color=df_filtered['Temperature_F_Clipped'],
+                colorscale='Jet',
+                cmin=clip_min,
+                cmax=clip_max,
+                colorbar=dict(title="Temp (°F)", thickness=10),
+                opacity=0.8
+            )
+        ))
+
+        fig_google.update_layout(
+            title=f"Hourly AI Weather Forecast: {selected_timestamp.strftime('%Y-%m-%d %H:%M %Z')}",
+            mapbox=dict(
+                style="open-street-map",
+                center=dict(lat=df_filtered['Latitude'].mean(), lon=df_filtered['Longitude'].mean()),
+                zoom=3,
+            ),
+            margin={"r": 0, "t": 40, "l": 0, "b": 0},
+            height=750,
+        )
+        st.plotly_chart(fig_google, use_container_width=True)
+    else:
+        st.info("No data available for selected time.")
+else:
+    st.warning("Could not load Google Hourly Forecast data.")
+
+st.markdown("---")
 
 # --- 6. GOOGLE AI FORECAST MAP (Hourly with Time Slider) ---
 st.subheader("6. Google AI Forecast Map (Hourly with Time Slider)")
