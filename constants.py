@@ -1,6 +1,7 @@
 # constants.py
 
 import os
+import streamlit as st
 
 # --- API KEYS ---
 # NOTE: In a real-world scenario, keys should be loaded from environment
