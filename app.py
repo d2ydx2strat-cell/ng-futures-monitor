@@ -275,6 +275,10 @@ def get_google_weather_forecast(locations_dict: dict, api_key: str) -> pd.DataFr
     """
     Pulls 10-day hourly forecast from Google Weather API for specific locations.
     """
+    # <<< ADD THIS LINE HERE >>>
+    import requests 
+    # <<< ------------------ >>>
+
     if not api_key:
         st.error("Could not retrieve hourly forecast data. Google Weather API Key is missing.")
         return pd.DataFrame()
