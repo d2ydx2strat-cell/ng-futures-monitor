@@ -14,7 +14,7 @@ from data_loader import (
     get_noaa_temp_anomaly_by_region,
     get_openweather_forecast_for_storage_regions,
     load_pipeline_data,
-    get_google_weather_forecast, # <-- ASSUMED/RETAINED
+    get_google_hourly_forecast_for_locations, # <-- ASSUMED/RETAINED
 )
 from analytics import (
     compute_storage_analytics,
