@@ -394,8 +394,29 @@ if not hourly_forecast_df.empty:
                 color=df_filtered['Temperature_F_Clipped'],
                 colorscale='Jet',
                 cmin=clip_min,
-st.markdown("---")
+                cmax=clip_max,
+                colorbar=dict(title="Temp (°F)", thickness=10),
+                opacity=0.8
+            )
+        ))
 
+        fig_google.update_layout(
+            title=f"Hourly AI Weather Forecast: {selected_timestamp.strftime('%Y-%m-%d %H:%M %Z')}",
+            mapbox=dict(
+                style="open-street-map",
+                center=dict(lat=df_filtered['Latitude'].mean(), lon=df_filtered['Longitude'].mean()),
+                zoom=3,
+            ),
+            margin={"r": 0, "t": 40, "l": 0, "b": 0},
+            height=750,
+        )
+        st.plotly_chart(fig_google, use_container_width=True)
+    else:
+        st.info("No data available for selected time.")
+else:
+    st.warning("Could not load Google Hourly Forecast data.")
+
+st.markdown("---")
 # --- 6. GOOGLE AI FORECAST MAP (Hourly with Time Slider) ---
 st.subheader("6. Google AI Forecast Map (Hourly with Time Slider)")
 st.caption("Visualizing hourly temperature forecasts for key US storage regions over the next 10 days using Google's Weather API.")
