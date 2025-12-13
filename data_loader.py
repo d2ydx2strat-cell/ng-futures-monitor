@@ -13,7 +13,7 @@ import geopandas as gpd
 from shapely.geometry import box
 import numpy as np
 import streamlit as st
-from constants import GOOGLE_WEATHER_API_KEY # Ensure this is imported
+
 
 from constants import (
     EIA_API_KEY,
@@ -296,27 +296,32 @@ def load_pipeline_data():
 # The base URL for the daily forecast endpoint
 HOURLY_FORECAST_URL = "https://weather.googleapis.com/v1/forecast/hourly:lookup"
 
-def get_google_hourly_forecast_for_locations(locations_dict: dict, api_key: str) -> pd.DataFrame:
+def get_google_weather_forecast(locations_dict: dict, api_key: str) -> pd.DataFrame:
     """
-    Fetches the up to 10-day hourly weather forecast for multiple locations.
+    Fetches the up to 10-day hourly weather forecast for multiple locations 
+    using Google Weather API.
     """
     all_data = []
     
-    session = requests.Session()
-    session.headers.update({"Accept": "application/json"})
+    # ... existing session/header setup ...
     
-    if not api_key: # Check if the passed key is empty/None
+    if not api_key:
         print("Warning: Google Weather API Key is missing.")
         return pd.DataFrame()
 
     for region, coords in locations_dict.items():
-        # ... existing code ...
+        lat = coords["Lat"] 
+        lon = coords["Lon"] 
         
         params = {
             "location.latitude": lat,
             "location.longitude": lon,
-            "key": api_key, # <-- Use the key passed as an argument
+            "key": api_key, # <-- USE THE PASSED ARGUMENT
         }
+
+        # ... rest of API call logic ...
+        
+    return pd.DataFrame(all_data)
 
     try:
         # Use your existing session setup for caching if available, otherwise use requests.get
