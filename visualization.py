@@ -5,6 +5,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import geopandas as gpd
 import streamlit as st
+import os
 
 from analytics import gdf_to_plotly_lines
 import numpy as np
@@ -116,6 +117,61 @@ def plot_mispricing(fv_df: pd.DataFrame):
     fig_mis.add_hline(y=0, line=dict(color='black', width=1))
     fig_mis.update_layout(title="NG1 Mispricing vs Fair Value", xaxis_title="Week", yaxis_title="$/MMBtu", height=300, margin=dict(l=10, r=10, t=40, b=10))
     return fig_mis
+
+# --- SECTION 6: GOOGLE HOURLY FORECAST MAP ---
+def plot_forecast_map_with_slider(weather_df: pd.DataFrame, current_timestamp: datetime.datetime):
+    """
+    Plots the Google hourly weather forecast for a selected time on a map.
+    """
+    # Filter data for the selected timestamp
+    df_filtered = weather_df[weather_df['Date_Time'] == current_timestamp].copy()
+
+    if df_filtered.empty:
+        # Fallback figure
+        fig = go.Figure()
+        fig.update_layout(title="No data available for selected time.", height=750)
+        return fig
+
+    # Determine colorscale properties (e.g., min/max temp)
+    temp_min = weather_df['Temperature_F'].min()
+    temp_max = weather_df['Temperature_F'].max()
+    
+    # Define a reasonable clip range for color scaling
+    clip_min = max(-10, temp_min - 5)
+    clip_max = min(100, temp_max + 5)
+    
+    df_filtered["Temperature_F_Clipped"] = df_filtered["Temperature_F"].clip(clip_min, clip_max)
+
+    fig = go.Figure(go.Scattermapbox(
+        mode="markers",
+        lon=df_filtered['Longitude'],
+        lat=df_filtered['Latitude'],
+        text=df_filtered['Region'] + "<br>" + df_filtered['Temperature_F'].round(1).astype(str) + "°F",
+        hoverinfo='text',
+        marker=dict(
+            size=20,
+            color=df_filtered['Temperature_F_Clipped'],
+            colorscale='Jet',
+            cmin=clip_min,
+            cmax=clip_max,
+            colorbar=dict(title="Temp (°F)", thickness=10),
+            opacity=0.8
+        )
+    ))
+    
+    # Use a simple map style for faster rendering without token dependency
+    fig.update_layout(
+        title=f"Hourly AI Weather Forecast: {current_timestamp.strftime('%Y-%m-%d %H:%M %Z')}",
+        mapbox=dict(
+            style="open-street-map",
+            center=dict(lat=df_filtered['Latitude'].mean(), lon=df_filtered['Longitude'].mean()),
+            zoom=3,
+        ),
+        margin={"r": 0, "t": 40, "l": 0, "b": 0},
+        height=750,
+    )
+    
+    return fig
 
 # --- SECTION 5: INFRASTRUCTURE MAP ---
 def create_satellite_map(
