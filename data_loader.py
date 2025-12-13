@@ -13,6 +13,7 @@ import geopandas as gpd
 from shapely.geometry import box
 import numpy as np
 import streamlit as st
+from constants import GOOGLE_WEATHER_API_KEY # Ensure this is imported
 
 from constants import (
     EIA_API_KEY,
@@ -289,3 +290,57 @@ def load_pipeline_data():
         st.error(f"Error loading pipeline shapefile: {e}")
         st.warning("Ensure .shp, .shx, .dbf, .prj (and .cpg) are present in the app directory.")
         return None, None, pd.DataFrame()
+
+
+
+# The base URL for the daily forecast endpoint
+DAILY_FORECAST_URL = "https://weather.googleapis.com/v1/forecast/days:lookup"
+
+
+def get_google_weather_forecast(lat: float, lon: float, api_key: str) -> pd.DataFrame:
+    """
+    Fetches the 10-day daily forecast from the Google Maps Platform Weather API
+    for a given latitude and longitude.
+    """
+    params = {
+        "location.latitude": lat,
+        "location.longitude": lon,
+        "key": api_key,
+    }
+
+    try:
+        # Use your existing session setup for caching if available, otherwise use requests.get
+        # Assuming you use a requests session setup similar to your other functions:
+        session = requests.Session() # Replace with your retry-enabled session if you have one
+        response = session.get(DAILY_FORECAST_URL, params=params)
+        response.raise_for_status() # Raise exception for bad status codes (4xx or 5xx)
+        data = response.json()
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching Google Weather data: {e}")
+        return pd.DataFrame()
+
+    if not data or 'dailyForecasts' not in data:
+        return pd.DataFrame()
+
+    forecasts = data['dailyForecasts']
+    
+    # Process the response into a standardized DataFrame
+    parsed_data = []
+    for day in forecasts:
+        # Google uses Celsius by default; you may need to convert to Fahrenheit
+        # if your app expects it, or use units=imperial in the API call if supported.
+        # Assuming you want the maximum temperature.
+        date_str = day.get('date')
+        max_temp_c = day.get('day', {}).get('maxTemperature', {}).get('value')
+        
+        if date_str and max_temp_c is not None:
+            # Conversion from Celsius to Fahrenheit (F = C * 9/5 + 32)
+            max_temp_f = (max_temp_c * 9/5) + 32
+            
+            parsed_data.append({
+                "Date": pd.to_datetime(date_str),
+                "Max_Temp_F": max_temp_f,
+                # Add other useful fields like min temp, precipitation, etc.
+            })
+
+    return pd.DataFrame(parsed_data).set_index("Date").sort_index()
