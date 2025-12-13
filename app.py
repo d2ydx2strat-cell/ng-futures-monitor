@@ -3,6 +3,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import os # <-- ADDED: For secure API key retrieval
 
 # Import functions from custom modules
 from constants import EIA_SERIES, REGION_CAPACITY_BCF, get_storage_centroids
@@ -13,7 +14,7 @@ from data_loader import (
     get_noaa_temp_anomaly_by_region,
     get_openweather_forecast_for_storage_regions,
     load_pipeline_data,
-    get_google_weather_forecast,
+    get_google_weather_forecast, # <-- ASSUMED/RETAINED
 )
 from analytics import (
     compute_storage_analytics,
@@ -31,6 +32,7 @@ from visualization import (
     plot_fair_value,
     plot_mispricing,
     create_satellite_map,
+    plot_forecast_map_with_slider, # <-- ADDED: New function for Google Map
 )
 
 
@@ -91,22 +93,22 @@ if storage_df is not None and not storage_df.empty:
 
     s_col1, s_col2, s_col3, s_col4 = st.columns(4)
     s_col1.metric(f"{selected_region} Working Gas (Bcf)",
-                  f"{current_level:,.0f}",
-                  delta=f"{level_deficit:,.0f} vs 5yr Avg")
+                    f"{current_level:,.0f}",
+                    delta=f"{level_deficit:,.0f} vs 5yr Avg")
 
     s_col2.metric("Weekly Change (Bcf)",
-                  f"{current_delta:,.0f}",
-                  delta=f"{delta_deficit:,.0f} vs 5yr Avg")
+                    f"{current_delta:,.0f}",
+                    delta=f"{delta_deficit:,.0f} vs 5yr Avg")
 
     s_col3.metric("Storage Level Z-Score",
-                  f"{level_z:.2f}" if pd.notna(level_z) else "N/A",
-                  delta="vs hist. week-of-year")
+                    f"{level_z:.2f}" if pd.notna(level_z) else "N/A",
+                    delta="vs hist. week-of-year")
 
     if capacity_bcf is not None:
         pct_full = current_level / capacity_bcf * 100
         s_col4.metric("Utilization (% of Capacity)",
-                      f"{pct_full:.1f}%",
-                      delta=None)
+                        f"{pct_full:.1f}%",
+                        delta=None)
     else:
         s_col4.metric("Utilization (% of Capacity)", "N/A", delta=None)
 
@@ -182,7 +184,10 @@ else:
     regions_to_map = ["East", "Midwest", "Mountain", "Pacific", "South Central Salt", "South Central Non-Salt"]
     centroids = get_storage_centroids()
     
-    noaa_regional_df = get_noaa_temp_anomaly_by_region()
+    # get_noaa_temp_anomaly_by_region should likely take the centroids dictionary
+    # Assuming the implementation handles it if called without args, 
+    # but explicitly passing centroids is safer if the function is complex.
+    noaa_regional_df = get_noaa_temp_anomaly_by_region(centroids)
     
     storage_map_data = []
     with st.spinner("Loading regional storage levels..."):
@@ -190,7 +195,7 @@ else:
             if reg in EIA_SERIES:
                 sid = EIA_SERIES[reg]
                 # Only need recent level for map, fetch minimal history
-                df_reg = get_eia_series(sid, length_weeks=5) 
+                df_reg = get_eia_series(sid, length_weeks=5)
                 
                 if df_reg is not None and not df_reg.empty:
                     latest_val = df_reg.iloc[-1]['value']
@@ -225,7 +230,8 @@ else:
         storage_points_df["normal_temp_est"] = np.nan
 
     # OpenWeather 14-day forecast + slider
-    ow_forecast_df = get_openweather_forecast_for_storage_regions(days=14)
+    # get_openweather_forecast_for_storage_regions should likely take the centroids dictionary
+    ow_forecast_df = get_openweather_forecast_for_storage_regions(centroids, days=14) 
     ow_forecast_for_map = pd.DataFrame()
 
     if not ow_forecast_df.empty:
@@ -259,9 +265,42 @@ else:
     )
     st.plotly_chart(fig_map, use_container_width=True)
 
+st.markdown("---")
 
-# --- 6. Regional Trade Screen ---
-st.markdown("### 6. Regional Trade Screen: Storage vs NOAA 7‑Day Outlook")
+
+# --- 6. GOOGLE AI FORECAST MAP (Hourly with Time Slider) ---
+st.subheader("6. Google AI Forecast Map (Hourly with Time Slider)")
+st.caption("Visualizing hourly temperature forecasts for key US storage regions over the next 10 days using Google's Weather API.")
+
+# 1. Retrieve the API Key securely using Streamlit secrets
+# Use st.secrets first, then fall back to environment variable if needed
+GOOGLE_WEATHER_API_KEY = st.secrets.get("GOOGLE_WEATHER_API_KEY", os.getenv("GOOGLE_WEATHER_API_KEY"))
+
+if not GOOGLE_WEATHER_API_KEY:
+    st.warning(
+        "**Google Weather API Key Missing.** Please set your Google Weather API Key "
+        "in your Streamlit secrets file (`.streamlit/secrets.toml`) or "
+        "as a secret in your cloud deployment named `GOOGLE_WEATHER_API_KEY`."
+    )
+else:
+    # 2. Fetch the data, passing the key and all centroids (from Section 5)
+    with st.spinner("Fetching 10-day hourly AI weather forecast..."):
+        weather_forecast_df = get_google_weather_forecast(
+            locations_dict=centroids, 
+            api_key=GOOGLE_WEATHER_API_KEY
+        )
+    
+    if not weather_forecast_df.empty:
+        # 3. Visualize the data using the new plot function
+        forecast_map_fig = plot_forecast_map_with_slider(weather_forecast_df)
+        st.plotly_chart(forecast_map_fig, use_container_width=True)
+    else:
+        st.error("Could not retrieve hourly forecast data. Check your Google Weather API Key and ensure the Weather API is enabled in your Google Cloud Project with billing activated.")
+
+st.markdown("---")
+
+# --- 7. Regional Trade Screen (Renumbered) ---
+st.markdown("### 7. Regional Trade Screen: Storage vs NOAA 7‑Day Outlook") # <-- RENAMED SECTION 6 TO 7
 
 if not storage_points_df.empty:
     trade_rows = []
@@ -270,7 +309,7 @@ if not storage_points_df.empty:
         if not sid:
             continue
         # Get full history for accurate Z-score calculation
-        df_reg_full = get_eia_series(sid, length_weeks=52*15) 
+        df_reg_full = get_eia_series(sid, length_weeks=52*15)
         if df_reg_full is None or df_reg_full.empty:
             continue
         df_reg_full = compute_storage_analytics(df_reg_full)
@@ -336,18 +375,3 @@ if not storage_points_df.empty:
         st.info("Insufficient data to build regional trade screen.")
 else:
     st.info("No storage map data available for trade screen.")
-
-# --- NEW SECTION: Fetching Google Weather Data (Example) ---
-from constants import GOOGLE_WEATHER_API_KEY, STORAGE_CENTROIDS # Ensure GOOGLE_WEATHER_API_KEY is available
-
-# Assuming you want the forecast for a specific storage region, e.g., the Henry Hub area.
-# You would need to iterate through all your STORAGE_CENTROIDS to get data for all regions.
-if GOOGLE_WEATHER_API_KEY and STORAGE_CENTROIDS:
-    # Example for one region (e.g., Henry Hub)
-    henry_hub_coords = STORAGE_CENTROIDS["Henry Hub"]
-    google_forecast_df = get_google_weather_forecast(
-        lat=henry_hub_coords["lat"],
-        lon=henry_hub_coords["lon"],
-        api_key=GOOGLE_WEATHER_API_KEY,
-    )
-    
