@@ -348,14 +348,7 @@ def get_google_weather_forecast(locations_dict: dict, api_key: str) -> pd.DataFr
     df = pd.DataFrame(rows)
     df.sort_values(["Date_Time", "Region"], inplace=True)
     return df
-3. Add the Display Section (Section 6)
-The original issue was due to missing files/imports, which led to the removal of the entire Section 6. Now you need to re-add the new Section 6 to app.py (after the map section, around line 770).
 
-Python
-
-# app.py
-
-# ... (End of Section 5 Map Logic) ...
 
 # 6. GOOGLE AI FORECAST MAP (Hourly with Time Slider)
 st.markdown("---")
@@ -401,28 +394,6 @@ if not hourly_forecast_df.empty:
                 color=df_filtered['Temperature_F_Clipped'],
                 colorscale='Jet',
                 cmin=clip_min,
-                cmax=clip_max,
-                colorbar=dict(title="Temp (°F)", thickness=10),
-                opacity=0.8
-            )
-        ))
-
-        fig_google.update_layout(
-            title=f"Hourly AI Weather Forecast: {selected_timestamp.strftime('%Y-%m-%d %H:%M %Z')}",
-            mapbox=dict(
-                style="open-street-map",
-                center=dict(lat=df_filtered['Latitude'].mean(), lon=df_filtered['Longitude'].mean()),
-                zoom=3,
-            ),
-            margin={"r": 0, "t": 40, "l": 0, "b": 0},
-            height=750,
-        )
-        st.plotly_chart(fig_google, use_container_width=True)
-    else:
-        st.info("No data available for selected time.")
-else:
-    st.warning("Could not load Google Hourly Forecast data.")
-
 st.markdown("---")
 
 # --- 6. GOOGLE AI FORECAST MAP (Hourly with Time Slider) ---
